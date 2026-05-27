@@ -10,21 +10,12 @@ import sys
 from paho.mqtt.client import CallbackAPIVersion
 from pprint import pprint
 
+RECONNECT_BASE = 1
+RECONNECT_MAX = 60
+
 SENT_COUNTDOWN = False
 SENT_COUNTDOWN_L1 = False
 SENT_COUNTDOWN_L2 = False
-
-def on_connect(client, userdata, flags, reason_code, properties):
-
-    if DEBUG >= 1:
-        print()
-        print(f"Connected: reason_code={reason_code}, properties={properties}")
-
-    client.subscribe(SUB_TOPIC)
-
-    if DEBUG >= 1:
-        print(f"Subscribed to {SUB_TOPIC}")
-        print()
 
 def parse_payload(payload):
 
@@ -58,22 +49,14 @@ def on_message(client, userdata, msg):
         pprint(payload)
         print()
 
-    if "state" in payload and payload["state"] == "OFF":
-        SENT_COUNTDOWN = False
-
     if "state_l1" in payload and payload["state_l1"] == "OFF":
         SENT_COUNTDOWN_L1 = False
 
-    if "state_l2" in payload and payload["state_l2"] == "OFF":
+    elif "state_l2" in payload and payload["state_l2"] == "OFF":
         SENT_COUNTDOWN_L2 = False
 
-    if "state" in payload and payload["state"] == "ON" and payload.get("countdown", 1440) <= 10 and not SENT_COUNTDOWN:
-        SENT_COUNTDOWN = True
-        client.publish(f"{msg.topic}/set", '{"state": "OFF"}')
-        client.publish(f"{msg.topic}/set", '{"state": "ON", "countdown": 1440}')
-
-        if DEBUG >= 1:
-            print(f"Set {msg.topic} countdown to 1440")
+    elif "state" in payload and payload["state"] == "OFF":
+        SENT_COUNTDOWN = False
 
     if "state_l1" in payload and payload.get("state_l1") == "ON" and payload.get("countdown_l1", 1440) <= 10 and not SENT_COUNTDOWN_L1:
         SENT_COUNTDOWN_L1 = True
@@ -83,7 +66,7 @@ def on_message(client, userdata, msg):
         if DEBUG >= 1:
             print(f"Set {msg.topic} countdown_l1 to 1440")
 
-    if "state_l2" in payload and payload.get("state_l2") == "ON" and payload.get("countdown_l2", 1440) <= 10 and not SENT_COUNTDOWN_L2:
+    elif "state_l2" in payload and payload.get("state_l2") == "ON" and payload.get("countdown_l2", 1440) <= 10 and not SENT_COUNTDOWN_L2:
         SENT_COUNTDOWN_L2 = True
         client.publish(f"{msg.topic}/set", '{"state_l2": "OFF"}')
         client.publish(f"{msg.topic}/set", '{"state_l2": "ON", "countdown_l2": 1440}')
@@ -91,7 +74,61 @@ def on_message(client, userdata, msg):
         if DEBUG >= 1:
             print(f"Set {msg.topic} countdown_l2 to 1440")
 
-print("Starting timer_reset.py...")
+    elif "state" in payload and payload.get("state") == "ON" and payload.get("countdown", 1440) <= 10 and not SENT_COUNTDOWN:
+        SENT_COUNTDOWN = True
+        client.publish(f"{msg.topic}/set", '{"state": "OFF"}')
+        client.publish(f"{msg.topic}/set", '{"state": "ON", "countdown": 1440}')
+
+        if DEBUG >= 1:
+            print(f"Set {msg.topic}/set countdown to 1440")
+
+def on_connect(client, userdata, flags, reason_code, properties):
+    global _reconnect_backoff
+
+    if reason_code == 0:
+        print("Connected to MQTT broker")
+
+        with _reconnect_lock:
+            _reconnect_backoff = RECONNECT_BASE
+
+        client.subscribe(SUB_TOPIC)
+
+        if DEBUG >= 1:
+            print(f"Subscribed to {SUB_TOPIC}")
+    else:
+        if DEBUG >= 1:
+            print()
+            print(f"Connected: reason_code={reason_code}, properties={properties}")
+
+def try_reconnect(client):
+    backoff = RECONNECT_BASE
+    while True:
+        try:
+            client.reconnect()
+            if DEBUG >= 1:
+                print("Reconnected to MQTT broker")
+            return
+        except Exception as e:
+            with _reconnect_lock:
+                backoff = _reconnect_backoff
+                _reconnect_backoff = min(RECONNECT_MAX, backoff * 2)
+
+            if DEBUG >= 1:
+                print(f"Reconnect failed: {e}; retrying in {backoff}s")
+
+            time.sleep(backoff)
+
+def on_disconnect(client, userdata, flags, reason_code, properties):
+    if DEBUG >= 1:
+        print("MQTT disconnected, rc =", reason_code)
+
+    if reason_code != 0:
+        # start a background reconnect thread (won't block network thread)
+        th = threading.Thread(target=try_reconnect, args=(client,), daemon=True)
+        th.start()
+
+if DEBUG >= 1:
+    print("Starting timer_reset.py...")
 
 parser = argparse.ArgumentParser(description="Simple MQTT client to listen for Smart Water Valves when they have the physical button pushed to turn the 'tap' off and on to get round the 10 minute default limit")
 parser.add_argument("-c", "--config", type = str, default="/etc/timer_reset.conf", help="Path to config file, /etc/timer_reset.conf is the default")
@@ -117,9 +154,9 @@ port = configParser.getint("MQTT", "port", fallback = 1883)
 username = configParser.get("MQTT", "username", fallback = None)
 password = configParser.get("MQTT", "password", fallback = None)
 
-SUB_TOPIC = configParser.get("MQTT", "topic", fallback = "zigbee2mqtt/#")
+SUB_TOPIC = configParser.get("MQTT", "topic", fallback = "#")
 
-client = mqtt.Client(CallbackAPIVersion.VERSION2)
+client = mqtt.Client(CallbackAPIVersion.VERSION2, username)
 
 if username is not None and password is not None:
     client.username_pw_set(username, password)
