@@ -6,7 +6,6 @@ import json
 import os
 import paho.mqtt.client as mqtt
 import sys
-import threading
 
 from paho.mqtt.client import CallbackAPIVersion
 from pprint import pprint
@@ -20,16 +19,13 @@ SENT_COUNTDOWN_L2 = False
 
 DEBUG = 0
 
-_reconnect_backoff = RECONNECT_BASE
-_reconnect_lock = threading.Lock()
-
-def parse_payload(payload):
+def parse_payload(topic, payload):
 
     text = payload.decode("utf-8")
 
     if text == "ping":
         response = "pong"
-        client.publish(PUB_TOPIC, "pong")
+        client.publish(topic, "pong")
         return False, text
 
     try:
@@ -45,7 +41,7 @@ def on_message(client, userdata, msg):
     if not msg.topic.endswith("Taps"):
         return
 
-    parsed, payload = parse_payload(msg.payload)
+    parsed, payload = parse_payload(msg.topic, msg.payload)
 
     if not parsed or not payload:
         return
@@ -89,13 +85,8 @@ def on_message(client, userdata, msg):
             print(f"Set {msg.topic}/set countdown to 1440")
 
 def on_connect(client, userdata, flags, reason_code, properties):
-    global _reconnect_backoff
-
     if reason_code == 0:
         print("Connected to MQTT broker")
-
-        with _reconnect_lock:
-            _reconnect_backoff = RECONNECT_BASE
 
         client.subscribe(SUB_TOPIC)
 
@@ -106,32 +97,17 @@ def on_connect(client, userdata, flags, reason_code, properties):
             print()
             print(f"Connected: reason_code={reason_code}, properties={properties}")
 
-def try_reconnect(client):
-    backoff = RECONNECT_BASE
-    while True:
-        try:
-            client.reconnect()
-            if DEBUG >= 1:
-                print("Reconnected to MQTT broker")
-            return
-        except Exception as e:
-            with _reconnect_lock:
-                backoff = _reconnect_backoff
-                _reconnect_backoff = min(RECONNECT_MAX, backoff * 2)
+        client.disconnect()
 
-            if DEBUG >= 1:
-                print(f"Reconnect failed: {e}; retrying in {backoff}s")
-
-            time.sleep(backoff)
+        sys.exit(1)
 
 def on_disconnect(client, userdata, flags, reason_code, properties):
     if DEBUG >= 1:
         print("MQTT disconnected, rc =", reason_code)
 
-    if reason_code != 0:
-        # start a background reconnect thread (won't block network thread)
-        th = threading.Thread(target=try_reconnect, args=(client,), daemon=True)
-        th.start()
+    client.disconnect()
+
+    sys.exit(2)
 
 parser = argparse.ArgumentParser(description="Simple MQTT client to listen for Smart Water Valves when they have the physical button pushed to turn the 'tap' off and on to get round the 10 minute default limit")
 parser.add_argument("-c", "--config", type = str, default="/etc/timer_reset.conf", help="Path to config file, /etc/timer_reset.conf is the default")
@@ -175,7 +151,7 @@ client.connect(hostname, port, 60)
 
 try:
     client.loop_forever()
-except KeyboardInterrupt:
+except Exception:
     print("Stopping")
 finally:
     client.disconnect()
