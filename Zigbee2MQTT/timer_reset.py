@@ -165,4 +165,10 @@ client.on_connect = on_connect
 client.on_message = on_message
 
 client.connect(hostname, port, 60)
-client.loop_forever()
+
+try:
+    client.loop_forever()
+except KeyboardInterrupt:
+    print("Stopping")
+finally:
+    client.disconnect()
