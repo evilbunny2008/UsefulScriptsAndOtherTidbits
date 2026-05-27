@@ -20,6 +20,9 @@ SENT_COUNTDOWN_L2 = False
 
 DEBUG = 0
 
+_reconnect_backoff = RECONNECT_BASE
+_reconnect_lock = threading.Lock()
+
 def parse_payload(payload):
 
     text = payload.decode("utf-8")
