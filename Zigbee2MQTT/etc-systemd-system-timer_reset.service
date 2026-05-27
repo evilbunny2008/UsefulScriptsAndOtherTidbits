@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/src/UsefulScriptsAndOtherTidbits/Zigbee2MQTT/timer_reset.py -vv
+ExecStart=/usr/src/UsefulScriptsAndOtherTidbits/Zigbee2MQTT/timer_reset.py -v
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
