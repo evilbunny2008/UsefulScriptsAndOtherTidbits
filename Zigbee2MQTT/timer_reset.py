@@ -17,6 +17,8 @@ SENT_COUNTDOWN = False
 SENT_COUNTDOWN_L1 = False
 SENT_COUNTDOWN_L2 = False
 
+DEBUG = 0
+
 def parse_payload(payload):
 
     text = payload.decode("utf-8")
@@ -127,15 +129,15 @@ def on_disconnect(client, userdata, flags, reason_code, properties):
         th = threading.Thread(target=try_reconnect, args=(client,), daemon=True)
         th.start()
 
-if DEBUG >= 1:
-    print("Starting timer_reset.py...")
-
 parser = argparse.ArgumentParser(description="Simple MQTT client to listen for Smart Water Valves when they have the physical button pushed to turn the 'tap' off and on to get round the 10 minute default limit")
 parser.add_argument("-c", "--config", type = str, default="/etc/timer_reset.conf", help="Path to config file, /etc/timer_reset.conf is the default")
 parser.add_argument('-v', '--verbose', action='count', default=0, help='Verbosity level (use -v, -vv, -vvv etc)')
 args = parser.parse_args()
 
 DEBUG = args.verbose
+
+if DEBUG >= 1:
+    print("Starting timer_reset.py...")
 
 if(not os.path.exists(args.config) or not os.path.isfile(args.config)):
     print(f"Config file {args.config} doesn't exist.")
