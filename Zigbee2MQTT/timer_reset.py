@@ -6,6 +6,7 @@ import json
 import os
 import paho.mqtt.client as mqtt
 import sys
+import threading
 
 from paho.mqtt.client import CallbackAPIVersion
 from pprint import pprint
@@ -164,6 +165,7 @@ if username is not None and password is not None:
     client.username_pw_set(username, password)
 
 client.on_connect = on_connect
+client.on_disconnect = on_disconnect
 client.on_message = on_message
 
 client.connect(hostname, port, 60)
