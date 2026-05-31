@@ -63,7 +63,7 @@ def on_message(client, userdata, msg):
     if "state_l1" in payload and payload.get("state_l1") == "ON" and payload.get("countdown_l1", 1440) <= 10 and not SENT_COUNTDOWN_L1:
         SENT_COUNTDOWN_L1 = True
         client.publish(f"{msg.topic}/set", '{"state_l1": "OFF"}')
-        client.publish(f"{msg.topic}/set", '{"state_l1": "ON", "countdown_l1": 1440}')
+        client.publish(f"{msg.topic}/set", '{"state_l1": "ON", "countdown_l1": 1440}', 2, True)
 
         if DEBUG >= 1:
             print(f"Set {msg.topic} countdown_l1 to 1440")
@@ -71,7 +71,7 @@ def on_message(client, userdata, msg):
     elif "state_l2" in payload and payload.get("state_l2") == "ON" and payload.get("countdown_l2", 1440) <= 10 and not SENT_COUNTDOWN_L2:
         SENT_COUNTDOWN_L2 = True
         client.publish(f"{msg.topic}/set", '{"state_l2": "OFF"}')
-        client.publish(f"{msg.topic}/set", '{"state_l2": "ON", "countdown_l2": 1440}')
+        client.publish(f"{msg.topic}/set", '{"state_l2": "ON", "countdown_l2": 1440}', 2, True)
 
         if DEBUG >= 1:
             print(f"Set {msg.topic} countdown_l2 to 1440")
@@ -79,7 +79,7 @@ def on_message(client, userdata, msg):
     elif "state" in payload and payload.get("state") == "ON" and payload.get("countdown", 1440) <= 10 and not SENT_COUNTDOWN:
         SENT_COUNTDOWN = True
         client.publish(f"{msg.topic}/set", '{"state": "OFF"}')
-        client.publish(f"{msg.topic}/set", '{"state": "ON", "countdown": 1440}')
+        client.publish(f"{msg.topic}/set", '{"state": "ON", "countdown": 1440}', 2, True)
 
         if DEBUG >= 1:
             print(f"Set {msg.topic}/set countdown to 1440")
