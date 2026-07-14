@@ -17,6 +17,7 @@ import json
 import re
 import sys
 
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
@@ -36,6 +37,15 @@ USER_AGENT = (
 UNIT_PATTERN = re.compile(
     r"(?=\d+[\d\s/.,]*\s?(?:g|kg|ml|l|tsp|tbsp|cup|cups|oz|lb|lbs)\b)", re.IGNORECASE
 )
+
+# Filenames/paths that usually indicate a non-content image: nav icons,
+# ads, tracking pixels, logos, spacers, social share buttons, etc.
+IMAGE_SKIP_PATTERN = re.compile(
+    r"(logo|icon|spacer|pixel|blank|banner|advert|sprite|button|social|"
+    r"share|avatar|placeholder|badge|rating-star|arrow|nav[-_]|header|footer)",
+    re.IGNORECASE,
+)
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 
 
 def iso8601_duration(minutes):
@@ -143,6 +153,66 @@ def split_ingredient_block(text):
     return pieces if len(pieces) > 1 else [text.strip()]
 
 
+def find_best_image(soup, url=None):
+    """
+    Best-effort search for a representative recipe photo, in priority order:
+      1. og:image / twitter:image meta tags (most reliable when present)
+      2. <link rel="image_src">
+      3. The largest plausible content <img> on the page, skipping obvious
+         chrome (logos, icons, ads, spacers, nav/social/share graphics)
+    Returns an absolute URL, or None if nothing suitable is found.
+    """
+    def absolutize(src):
+        return urljoin(url, src) if url else src
+
+    for prop in ("og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"):
+        tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+        if tag and tag.get("content"):
+            return absolutize(tag["content"].strip())
+
+    link_tag = soup.find("link", attrs={"rel": "image_src"})
+    if link_tag and link_tag.get("href"):
+        return absolutize(link_tag["href"].strip())
+
+    candidates = []
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
+        if not src:
+            continue
+        src_clean = src.strip()
+        if not src_clean.lower().split("?")[0].endswith(IMAGE_EXTENSIONS):
+            continue
+        if IMAGE_SKIP_PATTERN.search(src_clean):
+            continue
+
+        # Use width/height attributes as a rough size signal when available;
+        # otherwise fall back to a neutral score so the image isn't excluded.
+        try:
+            width = int(img.get("width", 0))
+            height = int(img.get("height", 0))
+        except ValueError:
+            width = height = 0
+        area = width * height
+
+        # Tiny declared dimensions (icons, tracking pixels) are disqualifying.
+        if width and width < 100:
+            continue
+        if height and height < 100:
+            continue
+
+        alt = (img.get("alt") or "").lower()
+        title_bonus = 1 if any(w in alt for w in ("recipe", "cake", "dish", "food")) else 0
+
+        candidates.append((area, title_bonus, absolutize(src_clean)))
+
+    if not candidates:
+        return None
+
+    # Prefer images explicitly tagged as food-related, then by declared area.
+    candidates.sort(key=lambda c: (c[1], c[0]), reverse=True)
+    return candidates[0][2]
+
+
 def heuristic_scrape(html, url=None):
     """
     Best-effort extractor for pages with no schema.org/JSON-LD/microdata at
@@ -176,6 +246,8 @@ def heuristic_scrape(html, url=None):
                     return text
         return None
 
+    image_url = find_best_image(soup, url=url)
+
     ingredients_text = find_section(["ingredient"])
     method_text = find_section(["method", "instructions", "directions"])
 
@@ -199,6 +271,7 @@ def heuristic_scrape(html, url=None):
         "@context": "https://schema.org",
         "@type": "Recipe",
         "name": title,
+        "image": [image_url] if image_url else None,
         "recipeYield": recipe_yield,
         "recipeIngredient": ingredients,
         "recipeInstructions": instructions,
