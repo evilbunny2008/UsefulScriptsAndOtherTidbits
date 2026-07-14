@@ -2,23 +2,26 @@
 
 """
 Convert recipe web pages into schema.org Recipe JSON-LD using the
-`recipe-scrapers` library.
+`recipe-scrapers` library and optionally upload to a Nextcloud Cookbook instance.
 
 Install:
     pip install recipe-scrapers
 
 Usage:
     python recipe_to_jsonld.py --url "https://example.com/some-recipe"
-    python recipe_to_jsonld.py --file saved_page.html --url "https://example.com/some-recipe"
+    python recipe_to_jsonld.py --url "https://example.com/some-recipe" --nextcloud-url "https://nextcloud.example.com" --nextcloud-user "myuser" --nextcloud-pass "mypass"
+    python recipe_to_jsonld.py --file saved_page.html --url "https://example.com/some-recipe" --out output.html
 """
 
 import argparse
+import base64
 import json
 import re
 import sys
 
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 from bs4 import BeautifulSoup
 
@@ -297,11 +300,81 @@ def scrape_from_file(path, url=None):
     return build_recipe_jsonld(scraper, canonical_url=url)
 
 
+def upload_to_nextcloud(recipe_json, nextcloud_url, username, password):
+    """
+    Upload a recipe to Nextcloud Cookbook via the API.
+
+    Args:
+        recipe_json: The recipe dict (will be JSON-encoded)
+        nextcloud_url: Base Nextcloud URL (e.g., "https://nextcloud.example.com")
+        username: Nextcloud username
+        password: Nextcloud password (or app password)
+
+    Returns:
+        True if successful, False otherwise.
+
+    Raises:
+        HTTPError or URLError on network issues.
+    """
+    # Ensure URL doesn't have trailing slash
+    nextcloud_url = nextcloud_url.rstrip("/")
+
+    api_endpoint = f"{nextcloud_url}/ocs/v2.php/apps/cookbook/api/v1/recipes"
+
+    # Create Basic Auth header
+    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+
+    # Prepare the request
+    payload = json.dumps(recipe_json).encode("utf-8")
+
+    request = Request(
+        api_endpoint,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "OCS-APIRequest": "true",
+            "Authorization": f"Basic {credentials}",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+
+    try:
+        response = urlopen(request)
+        status_code = response.status
+        response_data = response.read().decode("utf-8")
+
+        if status_code in (200, 201):
+            print(f"✓ Recipe uploaded successfully to Nextcloud Cookbook", file=sys.stderr)
+            return True
+        else:
+            print(f"⚠ Upload returned status {status_code}: {response_data}", file=sys.stderr)
+            return False
+
+    except HTTPError as e:
+        print(f"✗ HTTP Error {e.code}: {e.reason}", file=sys.stderr)
+        try:
+            error_body = e.read().decode("utf-8")
+            print(f"  Response: {error_body}", file=sys.stderr)
+        except:
+            pass
+        return False
+
+    except URLError as e:
+        print(f"✗ Network Error: {e.reason}", file=sys.stderr)
+        return False
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Convert a recipe page to schema.org Recipe JSON-LD")
+    parser = argparse.ArgumentParser(
+        description="Convert a recipe page to schema.org Recipe JSON-LD and optionally upload to Nextcloud"
+    )
     parser.add_argument("--url", help="Recipe URL (fetched live, or used as canonical URL with --file)")
     parser.add_argument("--file", help="Path to a locally saved HTML file (avoids live fetching)")
-    parser.add_argument("--out", help="Output file path (defaults to stdout)")
+    parser.add_argument("--out", help="Output file path (defaults to stdout). Skips Nextcloud upload if provided.")
+    parser.add_argument("--nextcloud-url", help="Nextcloud instance URL (e.g., https://nextcloud.example.com)")
+    parser.add_argument("--nextcloud-user", help="Nextcloud username")
+    parser.add_argument("--nextcloud-pass", help="Nextcloud password or app password")
     args = parser.parse_args()
 
     if not args.url and not args.file:
@@ -316,25 +389,4 @@ def main():
         print(f"recipe-scrapers found no schema markup ({e}); "
               f"falling back to heuristic HTML parsing...", file=sys.stderr)
         try:
-            html = open(args.file, encoding="utf-8").read() if args.file else fetch_html(args.url)
-            recipe_json = heuristic_scrape(html, url=args.url)
-            if not recipe_json.get("recipeIngredient") and not recipe_json.get("recipeInstructions"):
-                print("Heuristic parsing also failed to find ingredients/instructions. "
-                      "This page's markup may need a custom parser.", file=sys.stderr)
-                sys.exit(1)
-        except Exception as e2:
-            print(f"Heuristic fallback also failed: {e2}", file=sys.stderr)
-            sys.exit(1)
-
-    output = f'<script type="application/ld+json">\n{json.dumps(recipe_json, indent=2, ensure_ascii=False)}\n</script>'
-
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(output)
-        print(f"Written to {args.out}")
-    else:
-        print(output)
-
-
-if __name__ == "__main__":
-    main()
+            html = open(args.file, encoding
