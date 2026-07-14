@@ -111,14 +111,14 @@ def build_recipe_jsonld(scraper, canonical_url=None):
 
 
 def scrape_from_url(url):
-    scraper = scrape_me(url, wild_mode=True)
+    scraper = scrape_me(url)
     return build_recipe_jsonld(scraper, canonical_url=url)
 
 
 def scrape_from_file(path, url=None):
     with open(path, "r", encoding="utf-8") as f:
         html = f.read()
-    scraper = scrape_html(html=html, org_url=url or "https://example.com", wild_mode=True)
+    scraper = scrape_html(html=html, org_url=url or "https://example.com")
     return build_recipe_jsonld(scraper, canonical_url=url)
 
 
