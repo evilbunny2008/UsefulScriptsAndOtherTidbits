@@ -73,6 +73,56 @@ def iso8601_duration(minutes):
     return parts
 
 
+FRACTION_MAP = {
+    "\u00bc": "1/4",
+    "\u00bd": "1/2",
+    "\u00be": "3/4",
+    "\u2150": "1/7",
+    "\u2151": "1/9",
+    "\u2152": "1/10",
+    "\u2153": "1/3",
+    "\u2154": "2/3",
+    "\u2155": "1/5",
+    "\u2156": "2/5",
+    "\u2157": "3/5",
+    "\u2158": "4/5",
+    "\u2159": "1/6",
+    "\u215a": "5/6",
+    "\u215b": "1/8",
+    "\u215c": "3/8",
+    "\u215d": "5/8",
+    "\u215e": "7/8",
+}
+FRACTION_PATTERN = re.compile(r"(\d)?(" + "|".join(FRACTION_MAP.keys()) + ")")
+
+
+def normalize_fractions(text):
+    """Replace vulgar fraction symbols (e.g. ¼, ½, ¾) with plain ASCII
+    equivalents (1/4, 1/2, 3/4). If the symbol directly follows a whole
+    number (e.g. "1½"), a space is inserted so it reads as "1 1/2"."""
+    if not text:
+        return text
+
+    def repl(match):
+        whole, frac_char = match.group(1), match.group(2)
+        frac = FRACTION_MAP[frac_char]
+        return f"{whole} {frac}" if whole else frac
+
+    return FRACTION_PATTERN.sub(repl, text)
+
+
+def normalize_fractions_deep(obj):
+    """Recursively apply normalize_fractions to every string value in a
+    JSON-like structure (dict/list/str), leaving other types untouched."""
+    if isinstance(obj, str):
+        return normalize_fractions(obj)
+    if isinstance(obj, dict):
+        return {k: normalize_fractions_deep(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [normalize_fractions_deep(v) for v in obj]
+    return obj
+
+
 def clean_step_text(text):
     """Collapse embedded newline-plus-whitespace runs (e.g. from multi-line
     source markup) into a single space, so HowToStep text reads as one
@@ -657,6 +707,8 @@ def main():
             except Exception as e2:
                 print(f"Heuristic fallback also failed: {e2}", file=sys.stderr)
                 sys.exit(1)
+
+    recipe_json = normalize_fractions_deep(recipe_json)
 
     if args.nextcloud_url:
         upload_to_nextcloud(recipe_json, args.nextcloud_url, args.nextcloud_user, args.nextcloud_pass)
