@@ -19,14 +19,17 @@ import json
 import re
 import sys
 
-from urllib.parse import urljoin
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-
 from bs4 import BeautifulSoup
+
+from nextcloud_cookbook_api.client import CookbookClient
+from nextcloud_cookbook_api.models import Recipe
 
 from recipe_scrapers import scrape_html
 from recipe_scrapers._exceptions import RecipeScrapersExceptions
+
+from urllib.error import URLError, HTTPError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -216,6 +219,205 @@ def find_best_image(soup, url=None):
     return candidates[0][2]
 
 
+def find_recipe_node(obj, _depth=0):
+    """
+    Recursively search a parsed JSON blob (e.g. a Next.js __NEXT_DATA__
+    payload) for a dict that looks like a structured recipe object. Many
+    modern news/publisher sites render recipes client-side from an embedded
+    JSON app-state blob rather than emitting schema.org markup, so this is
+    tried as a middle step between recipe-scrapers and the raw-HTML
+    heuristic parser.
+    """
+    if _depth > 12:
+        return None
+    if isinstance(obj, dict):
+        if "recipeIngredientsPrepared" in obj or "recipeInstructionsPrepared" in obj:
+            return obj
+        for v in obj.values():
+            found = find_recipe_node(v, _depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_recipe_node(item, _depth + 1)
+            if found:
+                return found
+    return None
+
+
+def render_descriptor_text(node):
+    """Flatten a rich-text 'descriptor' node tree (CoreMedia/React-style) into plain text."""
+    if node is None:
+        return ""
+    if isinstance(node, list):
+        return "".join(render_descriptor_text(n) for n in node)
+    if not isinstance(node, dict):
+        return ""
+    if node.get("type") == "text":
+        return node.get("content", "")
+    if node.get("type") == "embed":
+        return ""  # skip images/embeds inside rich text
+    return "".join(render_descriptor_text(c) for c in node.get("children") or [])
+
+
+def extract_list_items(node, tag_names=("li",)):
+    """Find all <li>-equivalent nodes within a descriptor tree, returning their flattened text."""
+    items = []
+
+    def walk(n):
+        if isinstance(n, list):
+            for x in n:
+                walk(x)
+            return
+        if not isinstance(n, dict):
+            return
+        if n.get("key") in tag_names:
+            text = render_descriptor_text(n).strip()
+            if text:
+                items.append(text)
+            return  # don't descend further to avoid duplicate/nested text
+        for c in n.get("children") or []:
+            walk(c)
+
+    walk(node)
+    return items
+
+
+def extract_paragraphs(node):
+    """Fallback: flatten <p>/standfirst text blocks in a descriptor tree, one string per block."""
+    paras = []
+
+    def walk(n):
+        if isinstance(n, list):
+            for x in n:
+                walk(x)
+            return
+        if not isinstance(n, dict):
+            return
+        if n.get("key") in ("p", "@@standfirst"):
+            text = render_descriptor_text(n).strip()
+            if text:
+                paras.append(text)
+            return
+        for c in n.get("children") or []:
+            walk(c)
+
+    walk(node)
+    return paras
+
+
+def pick_best_media_image(featured_media):
+    """Given a featuredMedia-style list with nested picture/cropInfo data, pick one representative image URL."""
+    if not featured_media:
+        return None
+    for media in featured_media:
+        picture = media.get("picture") or media
+        for group in picture.get("cropInfo") or []:
+            if group.get("key") == "large":
+                ratios = group.get("value") or []
+                for want in ("16x9", "4x3", "3x2", "1x1"):
+                    for r in ratios:
+                        if r.get("ratio") == want and r.get("url"):
+                            return r["url"]
+                if ratios and ratios[0].get("url"):
+                    return ratios[0]["url"]
+    return None
+
+
+def build_recipe_from_app_state(node, url=None):
+    """Map a recipe-like dict found inside an embedded JSON app-state blob onto schema.org Recipe."""
+    name = node.get("name")
+    canonical = node.get("canonicalURL") or url
+
+    author = None
+    authors = (node.get("contributors") or {}).get("author") or []
+    if isinstance(authors, list) and authors:
+        author = authors[0].get("name")
+
+    ingredients = []
+    for group in (node.get("recipeIngredientsPrepared") or {}).get("ingredients") or []:
+        heading = group.get("heading")
+        if heading:
+            ingredients.append(heading.rstrip(":"))
+        ingredients.extend(group.get("ingredients") or [])
+
+    instructions = []
+    instr_node = ((node.get("recipeInstructionsPrepared") or {}).get("instructions") or {}).get("descriptor")
+    if instr_node:
+        steps = extract_list_items(instr_node, tag_names=("li",))
+        if not steps:
+            steps = extract_paragraphs(instr_node)
+        instructions = [{"@type": "HowToStep", "text": s} for s in steps]
+
+    description = None
+    text_node = (node.get("text") or {}).get("descriptor")
+    if text_node:
+        paras = extract_paragraphs(text_node)
+        if paras:
+            description = " ".join(paras[:2])  # keep it to the intro, not the full body
+
+    image_url = pick_best_media_image(node.get("featuredMedia"))
+
+    keywords = node.get("keywords")
+    if isinstance(keywords, list):
+        keywords = ", ".join(keywords)
+
+    category = node.get("recipeCategory")
+    if isinstance(category, list):
+        category = ", ".join(category)
+
+    recipe = {
+        "@context": "https://schema.org",
+        "@type": "Recipe",
+        "name": name,
+        "description": description,
+        "author": {"@type": "Person", "name": author} if author else None,
+        "image": [image_url] if image_url else None,
+        "recipeYield": node.get("recipeYield"),
+        "prepTime": iso8601_duration(node.get("preparationTime")),
+        "cookTime": iso8601_duration(node.get("cookingTime")),
+        "totalTime": iso8601_duration(node.get("totalTime")),
+        "recipeCategory": category,
+        "keywords": keywords,
+        "recipeIngredient": ingredients,
+        "recipeInstructions": instructions,
+        "url": canonical,
+    }
+    return {k: v for k, v in recipe.items() if v not in (None, "", [], {})}
+
+
+def app_state_scrape(html, url=None):
+    """
+    Look for an embedded JSON app-state blob (e.g. Next.js's
+    <script id="__NEXT_DATA__" type="application/json">) containing a
+    structured recipe object, and convert it if found. Returns None if no
+    such blob/recipe is present so callers can fall through to the next
+    strategy.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    scripts = []
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data and next_data.string:
+        scripts.append(next_data.string)
+    for tag in soup.find_all("script", attrs={"type": "application/json"}):
+        if tag is next_data or not tag.string:
+            continue
+        scripts.append(tag.string)
+
+    for raw in scripts:
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        recipe_node = find_recipe_node(data)
+        if recipe_node:
+            result = build_recipe_from_app_state(recipe_node, url=url)
+            if result.get("recipeIngredient") or result.get("recipeInstructions"):
+                return result
+    return None
+
+
 def heuristic_scrape(html, url=None):
     """
     Best-effort extractor for pages with no schema.org/JSON-LD/microdata at
@@ -317,52 +519,30 @@ def upload_to_nextcloud(recipe_json, nextcloud_url, username, password):
         HTTPError or URLError on network issues.
     """
     # Ensure URL doesn't have trailing slash
-    nextcloud_url = nextcloud_url.rstrip("/")
+    #nextcloud_url = nextcloud_url.rstrip("/")
 
-    api_endpoint = f"{nextcloud_url}/ocs/v2.php/apps/cookbook/api/v1/recipes"
+    #api_endpoint = f"{nextcloud_url}/ocs/v2.php/apps/cookbook/api/v1/recipes"
+
+    #print(f"api_endpoint: {api_endpoint}")
 
     # Create Basic Auth header
-    credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+    #credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
 
     # Prepare the request
-    payload = json.dumps(recipe_json).encode("utf-8")
+    #payload = json.dumps(recipe_json).encode("utf-8")
 
-    request = Request(
-        api_endpoint,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "OCS-APIRequest": "true",
-            "Authorization": f"Basic {credentials}",
-            "User-Agent": USER_AGENT,
-        },
-        method="POST",
+    print(f"nextcloud_url: {nextcloud_url}")
+
+    client = CookbookClient(
+        username=username,
+        password=password,
+        base_url=nextcloud_url,
     )
 
-    try:
-        response = urlopen(request)
-        status_code = response.status
-        response_data = response.read().decode("utf-8")
+    new_recipe = client.create_recipe(recipe_json)
 
-        if status_code in (200, 201):
-            print(f"✓ Recipe uploaded successfully to Nextcloud Cookbook", file=sys.stderr)
-            return True
-        else:
-            print(f"⚠ Upload returned status {status_code}: {response_data}", file=sys.stderr)
-            return False
-
-    except HTTPError as e:
-        print(f"✗ HTTP Error {e.code}: {e.reason}", file=sys.stderr)
-        try:
-            error_body = e.read().decode("utf-8")
-            print(f"  Response: {error_body}", file=sys.stderr)
-        except:
-            pass
-        return False
-
-    except URLError as e:
-        print(f"✗ Network Error: {e.reason}", file=sys.stderr)
-        return False
+    print(new_recipe.id)
+    print(new_recipe.name)
 
 
 def main():
@@ -387,6 +567,43 @@ def main():
             recipe_json = scrape_from_url(args.url)
     except RecipeScrapersExceptions as e:
         print(f"recipe-scrapers found no schema markup ({e}); "
-              f"falling back to heuristic HTML parsing...", file=sys.stderr)
+              f"checking for an embedded app-state recipe blob...", file=sys.stderr)
+        html = None
         try:
-            html = open(args.file, encoding
+            html = open(args.file, encoding="utf-8").read() if args.file else fetch_html(args.url)
+        except Exception as e_html:
+            print(f"Could not read/fetch HTML: {e_html}", file=sys.stderr)
+            sys.exit(1)
+
+        recipe_json = app_state_scrape(html, url=args.url)
+        if recipe_json:
+            print("Found recipe data in an embedded JSON blob (e.g. __NEXT_DATA__).", file=sys.stderr)
+        else:
+            print("No embedded app-state recipe found; falling back to heuristic HTML parsing...",
+                  file=sys.stderr)
+            try:
+                recipe_json = heuristic_scrape(html, url=args.url)
+                if not recipe_json.get("recipeIngredient") and not recipe_json.get("recipeInstructions"):
+                    print("Heuristic parsing also failed to find ingredients/instructions. "
+                          "This page's markup may need a custom parser.", file=sys.stderr)
+                    sys.exit(1)
+            except Exception as e2:
+                print(f"Heuristic fallback also failed: {e2}", file=sys.stderr)
+                sys.exit(1)
+
+    if args.nextcloud_url:
+        upload_to_nextcloud(recipe_json, args.nextcloud_url, args.nextcloud_user, args.nextcloud_pass)
+    else:
+
+        output = f'<script type="application/ld+json">\n{json.dumps(recipe_json, indent=2, ensure_ascii=False)}\n</script>'
+
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(output)
+            print(f"Written to {args.out}")
+        else:
+            print(output)
+
+
+if __name__ == "__main__":
+    main()
