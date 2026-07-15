@@ -41,7 +41,9 @@ USER_AGENT = (
 # paragraph or table cell, separated by line breaks that get flattened to
 # whitespace, or by a quantity+unit pattern repeating inline.
 UNIT_PATTERN = re.compile(
-    r"(?=\d+[\d\s/.,]*\s?(?:g|kg|ml|l|tsp|tbsp|cup|cups|oz|lb|lbs)\b)", re.IGNORECASE
+    r"(?<![/\d])(?=(?:\d+[\d\s/.,]*|[\u00bd\u00bc\u00be\u2153\u2154\u215b\u215c\u215d\u215e])"
+    r"\s*(?:g|kg|ml|l|tsp|tbsp|cup|cups|oz|lb|lbs)\b)",
+    re.IGNORECASE,
 )
 
 # Filenames/paths that usually indicate a non-content image: nav icons,
@@ -71,6 +73,17 @@ def iso8601_duration(minutes):
     return parts
 
 
+def clean_step_text(text):
+    """Collapse embedded newline-plus-whitespace runs (e.g. from multi-line
+    source markup) into a single space, so HowToStep text reads as one
+    continuous line."""
+    if not text:
+        return text
+    text = re.sub(r"\s*\n\s*", " ", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
 def safe(fn, default=None):
     """Call a scraper method, swallowing errors for fields a given site doesn't provide."""
     try:
@@ -86,12 +99,12 @@ def build_recipe_jsonld(scraper, canonical_url=None):
     instructions_list = safe(scraper.instructions_list, [])
     if instructions_list:
         instructions = [
-            {"@type": "HowToStep", "text": step} for step in instructions_list
+            {"@type": "HowToStep", "text": clean_step_text(step)} for step in instructions_list
         ]
     else:
         raw = safe(scraper.instructions, "")
         instructions = [
-            {"@type": "HowToStep", "text": line.strip()}
+            {"@type": "HowToStep", "text": clean_step_text(line)}
             for line in raw.split("\n")
             if line.strip()
         ]
@@ -149,14 +162,21 @@ def fetch_html(url):
 
 
 def split_ingredient_block(text):
-    """Split a chunk of run-together ingredient text into individual lines."""
-    # First try actual line breaks (works if <br> was converted to \n upstream)
+    """Split a chunk of run-together ingredient text into individual ingredients."""
+    # First split on actual line breaks (from <br> tags or literal newlines).
     lines = [l.strip(" -\u2022\t") for l in text.split("\n") if l.strip()]
-    if len(lines) > 1:
-        return lines
-    # Fall back to splitting right before each quantity+unit occurrence
-    pieces = [p.strip(" ,") for p in UNIT_PATTERN.split(text) if p.strip(" ,")]
-    return pieces if len(pieces) > 1 else [text.strip()]
+    if not lines:
+        return []
+
+    # Each resulting line may itself contain several ingredients crammed
+    # together with no delimiter at all (common when a site's markup only
+    # has a <br> here and there) -- split those further on quantity+unit
+    # boundaries.
+    result = []
+    for line in lines:
+        pieces = [p.strip(" ,") for p in UNIT_PATTERN.split(line) if p.strip(" ,")]
+        result.extend(pieces if len(pieces) > 1 else [line])
+    return result
 
 
 def find_best_image(soup, url=None):
@@ -347,7 +367,7 @@ def build_recipe_from_app_state(node, url=None):
         steps = extract_list_items(instr_node, tag_names=("li",))
         if not steps:
             steps = extract_paragraphs(instr_node)
-        instructions = [{"@type": "HowToStep", "text": s} for s in steps]
+        instructions = [{"@type": "HowToStep", "text": clean_step_text(s)} for s in steps]
 
     description = None
     text_node = (node.get("text") or {}).get("descriptor")
@@ -432,29 +452,76 @@ def heuristic_scrape(html, url=None):
     title_tag = soup.find("h1") or soup.find("title")
     title = title_tag.get_text(strip=True) if title_tag else None
 
-    def find_section(keywords):
+    # Keywords for every section type this parser recognizes, used so a
+    # scan for one section stops when it bumps into the start of another.
+    SECTION_KEYWORD_GROUPS = {
+        "ingredients": ["ingredient"],
+        "instructions": ["method", "instructions", "directions"],
+    }
+
+    def get_row_container(tag):
+        """The block-level container to treat as one 'row' of content: the
+        enclosing table row if there is one, otherwise the nearest
+        td/li/p/div ancestor."""
+        return tag.find_parent("tr") or tag.find_parent(["td", "li", "p", "div"]) or tag
+
+    def find_section(keywords, other_keyword_groups):
+        other_keywords = [kw for group in other_keyword_groups for kw in group]
         for tag in soup.find_all(["b", "strong", "h2", "h3", "h4", "p", "td"]):
             label = tag.get_text(strip=True).lower()
-            if any(kw in label for kw in keywords) and len(label) < 40:
-                # Prefer the parent cell/container's remaining text if it's a
-                # short inline label (e.g. "<b>Ingredients:</b> 175g butter...")
-                container = tag.find_parent(["td", "li", "p", "div"]) or tag
-                text = container.get_text("\n", strip=True)
-                # Strip the label itself off the front
-                text = re.sub(
-                    r"^\s*(ingredients|method|directions|instructions)\s*:?\s*",
-                    "",
-                    text,
-                    flags=re.IGNORECASE,
-                )
-                if text:
-                    return text
+            if not (any(kw in label for kw in keywords) and len(label) < 40):
+                continue
+
+            row = get_row_container(tag)
+            collected = []
+
+            # The row's own text covers the common inline case, e.g.
+            # "<b>Ingredients:</b> 175g butter...". Strip the label prefix.
+            own_text = row.get_text("\n", strip=True)
+            own_text = re.sub(
+                r"^\s*(ingredients|method|directions|instructions)\s*:?\s*",
+                "",
+                own_text,
+                flags=re.IGNORECASE,
+            )
+            if own_text:
+                collected.append(own_text)
+
+            # Some sites put the label in its own row/cell and the actual
+            # content in the row(s) that follow -- walk forward to catch
+            # that layout too, stopping when we hit the next section's own
+            # heading (detected via an actual heading-like tag, not by how
+            # long the sibling's merged text happens to be).
+            def sibling_starts_next_section(sib):
+                tags_to_check = [sib] if sib.name in ("b", "strong", "h2", "h3", "h4") else []
+                tags_to_check += sib.find_all(["b", "strong", "h2", "h3", "h4"])
+                for t in tags_to_check:
+                    lbl = t.get_text(strip=True).lower()
+                    if any(kw in lbl for kw in other_keywords) and len(lbl) < 40:
+                        return True
+                return False
+
+            for sib in row.find_next_siblings(limit=6):
+                if sibling_starts_next_section(sib):
+                    break
+                sib_text = sib.get_text("\n", strip=True)
+                if sib_text:
+                    collected.append(sib_text)
+                    break  # old-style sites usually put all content in one following row
+
+            text = "\n".join(c for c in collected if c)
+            if text:
+                return text
         return None
 
     image_url = find_best_image(soup, url=url)
 
-    ingredients_text = find_section(["ingredient"])
-    method_text = find_section(["method", "instructions", "directions"])
+    ingredients_text = find_section(
+        SECTION_KEYWORD_GROUPS["ingredients"], [SECTION_KEYWORD_GROUPS["instructions"]]
+    )
+    method_text = find_section(
+        SECTION_KEYWORD_GROUPS["instructions"], [SECTION_KEYWORD_GROUPS["ingredients"]]
+    )
 
     ingredients = split_ingredient_block(ingredients_text) if ingredients_text else []
 
@@ -469,7 +536,7 @@ def heuristic_scrape(html, url=None):
         # Split on sentence boundaries as a rough step approximation
         steps = re.split(r"(?<=[.!?])\s+(?=[A-Z])", method_text)
         instructions = [
-            {"@type": "HowToStep", "text": s.strip()} for s in steps if s.strip()
+            {"@type": "HowToStep", "text": clean_step_text(s)} for s in steps if s.strip()
         ]
 
     recipe = {
