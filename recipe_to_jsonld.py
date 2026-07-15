@@ -126,18 +126,16 @@ def normalize_fractions_deep(obj):
 # --- Imperial -> metric normalization -------------------------------------
 #
 # Scope, deliberately: weight (oz/lb <-> g/kg), length (in/inch <-> cm/mm),
-# volume (cup <-> ml), and oven temperature (°F <-> °C). tsp/tbsp are left
-# untouched -- they're used as informal volume units in metric recipes too,
-# and converting them tends to look like an unwanted change rather than a
-# cleanup. Cup-to-ml conversion is a fixed volumetric conversion (not
-# ingredient-density-aware), so a cup of flour and a cup of milk both use
-# the same factor -- fine for consistency, imprecise for baking accuracy.
+# volume (cup/tbsp/tsp <-> ml), and oven temperature (°F <-> °C). Cup and
+# tbsp/tsp conversions use fixed volumetric factors (not ingredient-density-
+# aware), so a cup of flour and a cup of milk convert identically -- fine
+# for consistency, imprecise for baking accuracy.
 
 QTY_TOKEN = r"\d+\s\d+/\d+|\d+/\d+|\d+(?:\.\d+)?"
 
 METRIC_UNITS = r"(?:kilograms?|kg|grams?|g|millilit(?:re|er)s?|ml|lit(?:re|er)s?|l|centimet(?:re|er)s?|cm|millimet(?:re|er)s?|mm)"
-IMPERIAL_UNITS_CHAIN = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|in)"
-IMPERIAL_UNITS_STANDALONE = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch)"
+IMPERIAL_UNITS_CHAIN = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|in|tablespoons?|tbsp|teaspoons?|tsp)"
+IMPERIAL_UNITS_STANDALONE = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|tablespoons?|tbsp|teaspoons?|tsp)"
 
 _CHAIN_TOKEN = rf"(?:{QTY_TOKEN})\s?(?:{METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})\b"
 CHAIN_RE = re.compile(rf"{_CHAIN_TOKEN}(?:\s*/\s*{_CHAIN_TOKEN})+", re.IGNORECASE)
@@ -203,6 +201,12 @@ def convert_imperial_token(qty_str, unit):
         ml = qty * 236.588
         if ml >= 1000:
             return f"{round_metric(ml / 1000, 'l')}l"
+        return f"{round_metric(ml, 'ml')}ml"
+    if unit_l in ("tbsp", "tablespoon", "tablespoons"):
+        ml = qty * 14.7868
+        return f"{round_metric(ml, 'ml')}ml"
+    if unit_l in ("tsp", "teaspoon", "teaspoons"):
+        ml = qty * 4.92892
         return f"{round_metric(ml, 'ml')}ml"
     if unit_l in ("in", "inch", "inches"):
         cm = qty * 2.54
