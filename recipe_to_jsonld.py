@@ -169,9 +169,14 @@ def parse_quantity(qty_str):
 
 def round_metric(value, unit):
     """Round a converted metric value to something recipe-realistic rather
-    than a long decimal."""
+    than a long decimal. Small quantities keep one decimal place so, e.g.,
+    a converted 1/4 tsp doesn't collapse to '0g'/'1g' and lose its meaning."""
     if unit in ("g", "ml"):
-        return int(round(value / 5) * 5) if value >= 100 else int(round(value))
+        if value >= 100:
+            return int(round(value / 5) * 5)
+        if value >= 5:
+            return int(round(value))
+        return round(value * 2) / 2  # nearest 0.5
     if unit in ("kg", "l"):
         return round(value, 2)
     if unit == "cm":
@@ -179,10 +184,28 @@ def round_metric(value, unit):
     return round(value, 1)
 
 
-def convert_imperial_token(qty_str, unit):
+LIQUID_KEYWORDS = (
+    "oil", "milk", "water", "juice", "vinegar", "wine", "beer", "stock", "broth",
+    "cream", "syrup", "sauce", "extract", "honey", "buttermilk", "yogurt", "yoghurt",
+    "molasses", "treacle", "liqueur", "brandy", "rum", "vanilla",
+)
+
+
+def is_liquid_ingredient(context_text):
+    """Best-effort check of whether an ingredient line describes a liquid
+    (oil, milk, stock, etc.), based on keywords in its text. Used to decide
+    whether a tsp/tbsp measurement should convert to ml (liquid) or g (dry)."""
+    if not context_text:
+        return False
+    lower = context_text.lower()
+    return any(kw in lower for kw in LIQUID_KEYWORDS)
+
+
+def convert_imperial_token(qty_str, unit, context=""):
     """Convert a single imperial quantity+unit to its metric equivalent
     string. Returns the original text unchanged if the quantity can't be
-    parsed (e.g. a range like '6-8 oz')."""
+    parsed (e.g. a range like '6-8 oz'). `context` is the surrounding
+    ingredient text, used only to decide ml-vs-g for tsp/tbsp."""
     original = f"{qty_str} {unit}".strip()
     qty = parse_quantity(qty_str)
     if qty is None:
@@ -203,11 +226,23 @@ def convert_imperial_token(qty_str, unit):
             return f"{round_metric(ml / 1000, 'l')}l"
         return f"{round_metric(ml, 'ml')}ml"
     if unit_l in ("tbsp", "tablespoon", "tablespoons"):
-        ml = qty * 14.7868
-        return f"{round_metric(ml, 'ml')}ml"
+        # tsp/tbsp are genuinely volume units. For liquids (oil, milk,
+        # stock, extract, ...) the honest conversion is ml. For dry
+        # ingredients (spices, salt, sugar, ...) recipe charts commonly
+        # approximate weight as roughly 1:1 with volume (~15g per tbsp) --
+        # a reasonable approximation for many spices/salt/sugar, less so
+        # for very light (herbs) or very dense (honey) ingredients.
+        if is_liquid_ingredient(context):
+            ml = qty * 14.7868
+            return f"{round_metric(ml, 'ml')}ml"
+        grams = qty * 14.7868
+        return f"{round_metric(grams, 'g')}g"
     if unit_l in ("tsp", "teaspoon", "teaspoons"):
-        ml = qty * 4.92892
-        return f"{round_metric(ml, 'ml')}ml"
+        if is_liquid_ingredient(context):
+            ml = qty * 4.92892
+            return f"{round_metric(ml, 'ml')}ml"
+        grams = qty * 4.92892
+        return f"{round_metric(grams, 'g')}g"
     if unit_l in ("in", "inch", "inches"):
         cm = qty * 2.54
         return f"{round_metric(cm, 'cm')}cm"
@@ -233,7 +268,7 @@ def _process_chain(match):
     if metric_tokens:
         return "/".join(metric_tokens)
     if imperial_tokens:
-        return convert_imperial_token(*imperial_tokens[0])
+        return convert_imperial_token(*imperial_tokens[0], context=match.string)
     return match.group(0)
 
 
@@ -241,7 +276,7 @@ def _process_standalone(match):
     m = _STANDALONE_SPLIT_RE.match(match.group(0))
     if not m:
         return match.group(0)
-    return convert_imperial_token(m.group(1), m.group(2))
+    return convert_imperial_token(m.group(1), m.group(2), context=match.string)
 
 
 def normalize_measurements(text):
