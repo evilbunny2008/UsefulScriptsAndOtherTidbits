@@ -123,6 +123,156 @@ def normalize_fractions_deep(obj):
     return obj
 
 
+# --- Imperial -> metric normalization -------------------------------------
+#
+# Scope, deliberately: weight (oz/lb <-> g/kg), length (in/inch <-> cm/mm),
+# volume (cup <-> ml), and oven temperature (°F <-> °C). tsp/tbsp are left
+# untouched -- they're used as informal volume units in metric recipes too,
+# and converting them tends to look like an unwanted change rather than a
+# cleanup. Cup-to-ml conversion is a fixed volumetric conversion (not
+# ingredient-density-aware), so a cup of flour and a cup of milk both use
+# the same factor -- fine for consistency, imprecise for baking accuracy.
+
+QTY_TOKEN = r"\d+\s\d+/\d+|\d+/\d+|\d+(?:\.\d+)?"
+
+METRIC_UNITS = r"(?:kilograms?|kg|grams?|g|millilit(?:re|er)s?|ml|lit(?:re|er)s?|l|centimet(?:re|er)s?|cm|millimet(?:re|er)s?|mm)"
+IMPERIAL_UNITS_CHAIN = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|in)"
+IMPERIAL_UNITS_STANDALONE = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch)"
+
+_CHAIN_TOKEN = rf"(?:{QTY_TOKEN})\s?(?:{METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})\b"
+CHAIN_RE = re.compile(rf"{_CHAIN_TOKEN}(?:\s*/\s*{_CHAIN_TOKEN})+", re.IGNORECASE)
+STANDALONE_RE = re.compile(rf"(?:{QTY_TOKEN})\s?{IMPERIAL_UNITS_STANDALONE}\b", re.IGNORECASE)
+
+_TOKEN_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})$", re.IGNORECASE)
+_STANDALONE_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({IMPERIAL_UNITS_STANDALONE})$", re.IGNORECASE)
+
+TEMP_C = r"(\d+)\s?\u00b0?\s?C\b"
+TEMP_F = r"(\d+)\s?\u00b0?\s?F\b"
+CF_PAIR_RE = re.compile(rf"{TEMP_C}\s*[/(]\s*{TEMP_F}\)?")
+FC_PAIR_RE = re.compile(rf"{TEMP_F}\s*[/(]\s*{TEMP_C}\)?")
+LONE_F_RE = re.compile(TEMP_F)
+
+
+def parse_quantity(qty_str):
+    """Parse '6', '1 1/2', or '3/4' into a float. Returns None for anything
+    unparseable (e.g. ranges like '6-8'), so the caller can leave those alone."""
+    qty_str = qty_str.strip()
+    m = re.match(r"^(\d+)\s(\d+)/(\d+)$", qty_str)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / int(m.group(3))
+    m = re.match(r"^(\d+)/(\d+)$", qty_str)
+    if m:
+        return int(m.group(1)) / int(m.group(2))
+    try:
+        return float(qty_str)
+    except ValueError:
+        return None
+
+
+def round_metric(value, unit):
+    """Round a converted metric value to something recipe-realistic rather
+    than a long decimal."""
+    if unit in ("g", "ml"):
+        return int(round(value / 5) * 5) if value >= 100 else int(round(value))
+    if unit in ("kg", "l"):
+        return round(value, 2)
+    if unit == "cm":
+        return round(value * 2) / 2  # nearest 0.5 cm
+    return round(value, 1)
+
+
+def convert_imperial_token(qty_str, unit):
+    """Convert a single imperial quantity+unit to its metric equivalent
+    string. Returns the original text unchanged if the quantity can't be
+    parsed (e.g. a range like '6-8 oz')."""
+    original = f"{qty_str} {unit}".strip()
+    qty = parse_quantity(qty_str)
+    if qty is None:
+        return original
+
+    unit_l = unit.lower()
+    if unit_l in ("oz", "ounce", "ounces"):
+        grams = qty * 28.3495
+        return f"{round_metric(grams, 'g')}g"
+    if unit_l in ("lb", "lbs", "pound", "pounds"):
+        grams = qty * 453.592
+        if grams >= 1000:
+            return f"{round_metric(grams / 1000, 'kg')}kg"
+        return f"{round_metric(grams, 'g')}g"
+    if unit_l in ("cup", "cups"):
+        ml = qty * 236.588
+        if ml >= 1000:
+            return f"{round_metric(ml / 1000, 'l')}l"
+        return f"{round_metric(ml, 'ml')}ml"
+    if unit_l in ("in", "inch", "inches"):
+        cm = qty * 2.54
+        return f"{round_metric(cm, 'cm')}cm"
+    return original
+
+
+def _process_chain(match):
+    """Handle a run of qty+unit tokens joined by '/' (e.g. '175 g/6 oz',
+    '18 cm / 7 in'). Keep only the metric token(s); if the whole chain is
+    imperial with no metric alternative given, convert the first token."""
+    tokens = [t.strip() for t in re.split(r"\s*/\s*", match.group(0))]
+    metric_tokens, imperial_tokens = [], []
+    for t in tokens:
+        m = _TOKEN_SPLIT_RE.match(t)
+        if not m:
+            metric_tokens.append(t)  # unparsed segment: keep as-is, don't drop data
+            continue
+        qty_str, unit = m.group(1), m.group(2)
+        if re.fullmatch(METRIC_UNITS, unit, re.IGNORECASE):
+            metric_tokens.append(t)
+        else:
+            imperial_tokens.append((qty_str, unit))
+    if metric_tokens:
+        return "/".join(metric_tokens)
+    if imperial_tokens:
+        return convert_imperial_token(*imperial_tokens[0])
+    return match.group(0)
+
+
+def _process_standalone(match):
+    m = _STANDALONE_SPLIT_RE.match(match.group(0))
+    if not m:
+        return match.group(0)
+    return convert_imperial_token(m.group(1), m.group(2))
+
+
+def normalize_measurements(text):
+    """Strip redundant imperial units when a metric equivalent is already
+    given (e.g. '175 g/6 oz' -> '175 g'), and convert imperial-only
+    quantities (weight, length, volume, oven temperature) to metric when no
+    metric alternative is present at all."""
+    if not text:
+        return text
+
+    # Oven temperature: prefer/keep Celsius when both are given; convert a
+    # lone Fahrenheit reading when no Celsius figure appears alongside it.
+    text = CF_PAIR_RE.sub(lambda m: f"{m.group(1)}\u00b0C", text)
+    text = FC_PAIR_RE.sub(lambda m: f"{m.group(2)}\u00b0C", text)
+    text = LONE_F_RE.sub(lambda m: f"{round(( int(m.group(1)) - 32) * 5 / 9 / 5) * 5}\u00b0C", text)
+
+    # Weight/length/volume: metric/imperial pairs joined by '/', then any
+    # remaining standalone imperial-only quantities.
+    text = CHAIN_RE.sub(_process_chain, text)
+    text = STANDALONE_RE.sub(_process_standalone, text)
+    return text
+
+
+def normalize_measurements_deep(obj):
+    """Recursively apply normalize_measurements to every string value in a
+    JSON-like structure (dict/list/str), leaving other types untouched."""
+    if isinstance(obj, str):
+        return normalize_measurements(obj)
+    if isinstance(obj, dict):
+        return {k: normalize_measurements_deep(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [normalize_measurements_deep(v) for v in obj]
+    return obj
+
+
 def clean_step_text(text):
     """Collapse embedded newline-plus-whitespace runs (e.g. from multi-line
     source markup) into a single space, so HowToStep text reads as one
@@ -709,6 +859,7 @@ def main():
                 sys.exit(1)
 
     recipe_json = normalize_fractions_deep(recipe_json)
+    recipe_json = normalize_measurements_deep(recipe_json)
 
     if args.nextcloud_url:
         upload_to_nextcloud(recipe_json, args.nextcloud_url, args.nextcloud_user, args.nextcloud_pass)
