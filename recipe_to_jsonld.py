@@ -334,6 +334,32 @@ def normalize_ingredient_phrasing(ingredients):
     return [reorder_leading_descriptor(i) if isinstance(i, str) else i for i in ingredients]
 
 
+NUMBER_START_RE = re.compile(r"^\s*\d")
+
+
+def ensure_leading_quantity(ingredients):
+    """
+    Tools that recalculate ingredient amounts by serving size (e.g.
+    Nextcloud Cookbook) require every ingredient line to start with a
+    parseable amount. Lines with no quantity at all -- e.g. 'Fresh
+    parsley, chopped' or 'Lemon juice' -- get a nominal '1 ' prefix so
+    they parse as 'amount ingredient', even though '1' isn't a precise
+    measurement for something like a garnish. Group-heading lines (e.g.
+    'To serve:', marked with a trailing colon) are left alone since
+    they aren't ingredients at all.
+    """
+    if not isinstance(ingredients, list):
+        return ingredients
+    result = []
+    for item in ingredients:
+        if isinstance(item, str):
+            stripped = item.strip()
+            if stripped and not NUMBER_START_RE.match(stripped) and not stripped.endswith(":"):
+                item = f"1 {stripped}"
+        result.append(item)
+    return result
+
+
 def normalize_measurements_deep(obj):
     """Recursively apply normalize_measurements to every string value in a
     JSON-like structure (dict/list/str), leaving other types untouched."""
@@ -630,9 +656,18 @@ def build_recipe_from_app_state(node, url=None):
     ingredients = []
     for group in (node.get("recipeIngredientsPrepared") or {}).get("ingredients") or []:
         heading = group.get("heading")
+        group_ingredients = group.get("ingredients") or []
         if heading:
-            ingredients.append(heading.rstrip(":"))
-        ingredients.extend(group.get("ingredients") or [])
+            # schema.org's Recipe type has no real construct for grouped
+            # ingredients (e.g. "For the topping" / "To serve"), and tools
+            # like Nextcloud Cookbook just store a flat list of strings --
+            # so a bare heading line ends up rendered as if it were an
+            # actual (unquantified) ingredient. Fold the heading into each
+            # ingredient in that group instead of emitting it as its own
+            # fake ingredient line.
+            heading_clean = heading.rstrip(":").strip()
+            group_ingredients = [f"{ing} ({heading_clean.lower()})" for ing in group_ingredients]
+        ingredients.extend(group_ingredients)
 
     instructions = []
     instr_node = ((node.get("recipeInstructionsPrepared") or {}).get("instructions") or {}).get("descriptor")
@@ -1016,6 +1051,7 @@ def main():
     recipe_json = normalize_measurements_deep(recipe_json)
     if "recipeIngredient" in recipe_json:
         recipe_json["recipeIngredient"] = normalize_ingredient_phrasing(recipe_json["recipeIngredient"])
+        recipe_json["recipeIngredient"] = ensure_leading_quantity(recipe_json["recipeIngredient"])
 
     if args.nextcloud_url:
         upload_to_nextcloud(recipe_json, args.nextcloud_url, args.nextcloud_user, args.nextcloud_pass)
