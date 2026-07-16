@@ -798,6 +798,15 @@ def heuristic_scrape(html, url=None):
     """
     soup = BeautifulSoup(html, "html.parser")
 
+    # BeautifulSoup's get_text() includes text inside <script>/<style> tags
+    # by default. Some site builders (Squarespace notably) inject per-block
+    # <style> tags directly inside content containers, right alongside the
+    # actual text, so without this those CSS rules get swept into
+    # ingredients/instructions verbatim. Nothing in this heuristic parser
+    # ever wants script/style content, so strip it up front.
+    for tag in soup.find_all(["script", "style"]):
+        tag.decompose()
+
     title = extract_title(soup)
 
     # Keywords for every section type this parser recognizes, used so a
