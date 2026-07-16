@@ -18,11 +18,12 @@ import base64
 import json
 import re
 import sys
+from datetime import datetime, timezone
 
 from bs4 import BeautifulSoup
 
 from nextcloud_cookbook_api.client import CookbookClient
-from nextcloud_cookbook_api.models import Recipe
+from nextcloud_cookbook_api.models import Nutrition, Recipe
 
 from recipe_scrapers import scrape_html
 from recipe_scrapers._exceptions import RecipeScrapersExceptions
@@ -298,6 +299,39 @@ def normalize_measurements(text):
     text = CHAIN_RE.sub(_process_chain, text)
     text = STANDALONE_RE.sub(_process_standalone, text)
     return text
+
+
+LEADING_DESCRIPTOR_RE = re.compile(
+    r"^([A-Za-z][A-Za-z\s]{2,40}?)\s+of\s+"
+    r"(\d+(?:\s\d+/\d+|/\d+)?)\s+"
+    r"(.+)$"
+)
+
+
+def reorder_leading_descriptor(text):
+    """
+    Some ingredient phrasing puts the quantity in the middle of the
+    sentence rather than at the start (e.g. 'Grated rind of 1 lemon',
+    'Juice of 2 limes'). Tools that need a leading 'amount unit ingredient'
+    format -- e.g. Nextcloud Cookbook's serving-size recalculation --
+    can't parse those and will flag a syntax error. This moves the
+    quantity to the front: 'Grated rind of 1 lemon' -> '1 lemon, grated
+    rind'.
+    """
+    if not text:
+        return text
+    m = LEADING_DESCRIPTOR_RE.match(text.strip())
+    if not m:
+        return text
+    descriptor, qty, rest = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+    return f"{qty} {rest}, {descriptor.lower()}"
+
+
+def normalize_ingredient_phrasing(ingredients):
+    """Apply reorder_leading_descriptor to a recipeIngredient list."""
+    if not isinstance(ingredients, list):
+        return ingredients
+    return [reorder_leading_descriptor(i) if isinstance(i, str) else i for i in ingredients]
 
 
 def normalize_measurements_deep(obj):
@@ -677,6 +711,47 @@ def app_state_scrape(html, url=None):
     return None
 
 
+def extract_title(soup):
+    """
+    Pick the recipe's title, robust to pages that have more than one
+    heading-like element (e.g. a sitewide banner heading plus the actual
+    recipe title) -- naively taking the first <h1> can grab the wrong one.
+
+    Strategy: the <title> tag reliably contains the real page title (often
+    with a site-name prefix/suffix, e.g. "Recipes - Microwave Fruit Cake
+    Recipe"). If any <h1> on the page has text that also appears in the
+    <title> tag, that's almost certainly the actual recipe title (a generic
+    banner heading like "Baking Recipes" usually won't appear in <title> at
+    all). Falls back to the first <h1>, then to <title> itself with a
+    likely site-name segment stripped off.
+    """
+    title_tag = soup.find("title")
+    title_text = title_tag.get_text(strip=True) if title_tag else None
+
+    h1_texts = [h.get_text(strip=True) for h in soup.find_all("h1") if h.get_text(strip=True)]
+
+    if title_text:
+        # Prefer the longest matching h1 (most specific) that's actually
+        # contained in the <title> text.
+        matches = [h for h in h1_texts if h in title_text]
+        if matches:
+            return max(matches, key=len)
+        # No h1 matched the <title> at all (e.g. the only h1 is an
+        # unrelated sitewide banner) -- try to strip a likely site-name
+        # segment off the <title> itself rather than trusting that h1.
+        for sep in (" - ", " | ", ": "):
+            if sep in title_text:
+                parts = [p.strip() for p in title_text.split(sep) if p.strip()]
+                if parts:
+                    return max(parts, key=len)  # longer segment is usually the real title, not the site name
+        return title_text
+
+    if h1_texts:
+        return h1_texts[0]
+
+    return None
+
+
 def heuristic_scrape(html, url=None):
     """
     Best-effort extractor for pages with no schema.org/JSON-LD/microdata at
@@ -688,8 +763,7 @@ def heuristic_scrape(html, url=None):
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    title_tag = soup.find("h1") or soup.find("title")
-    title = title_tag.get_text(strip=True) if title_tag else None
+    title = extract_title(soup)
 
     # Keywords for every section type this parser recognizes, used so a
     # scan for one section stops when it bumps into the start of another.
@@ -813,42 +887,83 @@ def upload_to_nextcloud(recipe_json, nextcloud_url, username, password):
     Upload a recipe to Nextcloud Cookbook via the API.
 
     Args:
-        recipe_json: The recipe dict (will be JSON-encoded)
+        recipe_json: The schema.org Recipe dict produced by this script
         nextcloud_url: Base Nextcloud URL (e.g., "https://nextcloud.example.com")
         username: Nextcloud username
         password: Nextcloud password (or app password)
 
     Returns:
-        True if successful, False otherwise.
+        The ID of the newly created recipe (str).
 
     Raises:
         HTTPError or URLError on network issues.
     """
-    # Ensure URL doesn't have trailing slash
-    #nextcloud_url = nextcloud_url.rstrip("/")
+    # create_recipe() expects an actual nextcloud_cookbook_api Recipe model,
+    # not a plain dict -- it calls recipe.model_dump(...) internally, which
+    # a dict doesn't have. The Cookbook API's own field names/types also
+    # differ from schema.org's, so we need to translate rather than pass
+    # our JSON-LD straight through:
+    #   - recipeInstructions here is a list of {"@type": "HowToStep", "text": ...}
+    #     dicts; Cookbook wants a plain list[str].
+    #   - recipeYield here is free text (e.g. "4 servings" or a yield note);
+    #     Cookbook wants an int number of servings.
+    #   - id/date_created/date_modified are required by the model but are
+    #     assigned by the server on creation, so we fill in placeholders.
+    #   - nutrition is a required field on the model; we send an empty one
+    #     if we don't have real nutrition data.
+    instructions = [
+        step.get("text", "") if isinstance(step, dict) else str(step)
+        for step in recipe_json.get("recipeInstructions", [])
+    ]
 
-    #api_endpoint = f"{nextcloud_url}/ocs/v2.php/apps/cookbook/api/v1/recipes"
+    yield_match = re.search(r"\d+", str(recipe_json.get("recipeYield", "")))
+    servings = int(yield_match.group()) if yield_match else 1
 
-    #print(f"api_endpoint: {api_endpoint}")
+    image = recipe_json.get("image", "")
+    if isinstance(image, list):
+        image = image[0] if image else ""
 
-    # Create Basic Auth header
-    #credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+    # model_construct() bypasses the model's normal validators (including
+    # the one that parses a comma-separated keywords string into a list),
+    # so do that conversion ourselves rather than passing the raw string
+    # through -- otherwise it gets serialized character-by-character.
+    keywords_raw = recipe_json.get("keywords")
+    if isinstance(keywords_raw, str):
+        keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+    elif isinstance(keywords_raw, list):
+        keywords = keywords_raw
+    else:
+        keywords = None
 
-    # Prepare the request
-    #payload = json.dumps(recipe_json).encode("utf-8")
+    now = datetime.now(timezone.utc)
 
-    print(f"nextcloud_url: {nextcloud_url}")
-
-    client = CookbookClient(
-        username=username,
-        password=password,
-        base_url=nextcloud_url,
+    recipe = Recipe.model_construct(
+        id="",  # server assigns the real ID on creation
+        name=recipe_json.get("name", ""),
+        keywords=keywords,
+        date_created=now,
+        date_modified=now,
+        image_url=image,
+        image_placeholder_url="",
+        type="Recipe",
+        prep_time=recipe_json.get("prepTime"),
+        cook_time=recipe_json.get("cookTime"),
+        total_time=recipe_json.get("totalTime"),
+        description=recipe_json.get("description", ""),
+        url=recipe_json.get("url", ""),
+        image=image,
+        servings=servings,
+        category=recipe_json.get("recipeCategory", ""),
+        tools=[],
+        ingredients=recipe_json.get("recipeIngredient", []),
+        instructions=instructions,
+        nutrition=Nutrition.model_construct(type="NutritionInformation"),
     )
 
-    new_recipe = client.create_recipe(recipe_json)
-
-    print(new_recipe.id)
-    print(new_recipe.name)
+    client = CookbookClient(username=username, password=password, base_url=nextcloud_url)
+    new_recipe_id = client.create_recipe(recipe)  # returns the new recipe's ID (str)
+    print(f"Created recipe '{recipe.name}' with ID: {new_recipe_id}")
+    return new_recipe_id
 
 
 def main():
@@ -899,6 +1014,8 @@ def main():
 
     recipe_json = normalize_fractions_deep(recipe_json)
     recipe_json = normalize_measurements_deep(recipe_json)
+    if "recipeIngredient" in recipe_json:
+        recipe_json["recipeIngredient"] = normalize_ingredient_phrasing(recipe_json["recipeIngredient"])
 
     if args.nextcloud_url:
         upload_to_nextcloud(recipe_json, args.nextcloud_url, args.nextcloud_user, args.nextcloud_pass)
