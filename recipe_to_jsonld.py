@@ -375,6 +375,9 @@ def _process_standalone(match):
     return convert_imperial_token(m.group(1), m.group(2), context=_local_liquid_context(match))
 
 
+DEGREE_LOOKALIKE_RE = re.compile(r"\u02da(?=\s*[CF]\b)")
+
+
 def normalize_measurements(text):
     """Strip redundant imperial units when a metric equivalent is already
     given (e.g. '175 g/6 oz' -> '175 g'), and convert imperial-only
@@ -382,6 +385,13 @@ def normalize_measurements(text):
     metric alternative is present at all."""
     if not text:
         return text
+
+    # Some sources use "˚" (U+02DA, modifier letter ring above) instead of
+    # the real degree sign "°" (U+00B0) -- a common copy-paste substitution
+    # that looks identical at a glance. Normalize it first so it's both
+    # typographically correct and recognized by the temperature patterns
+    # below (which only match the real degree sign).
+    text = DEGREE_LOOKALIKE_RE.sub("\u00b0", text)
 
     # Oven temperature: prefer/keep Celsius when both are given; convert a
     # lone Fahrenheit reading when no Celsius figure appears alongside it.
@@ -402,6 +412,27 @@ LEADING_DESCRIPTOR_RE = re.compile(
     r"(\d+(?:\s\d+/\d+|/\d+)?)\s+"
     r"(.+)$"
 )
+
+
+TRAILING_RECIPE_WORD_RE = re.compile(r"[\s\-|:]*recipe\.?\s*$", re.IGNORECASE)
+
+
+def strip_redundant_title_suffix(name):
+    """
+    Many recipe sites' titles end in a redundant "Recipe" (e.g. "Seared
+    Barramundi with Corn Salad Recipe"), inherited from an SEO-oriented
+    <title> tag or site-wide template. That's fine on the original website,
+    but redundant noise once the recipe lives in a dedicated recipe manager
+    (e.g. Nextcloud Cookbook) that already knows it's a recipe. Strips a
+    trailing "Recipe" word (with any immediately preceding punctuation/
+    whitespace), case-insensitively. Leaves the title alone if that would
+    remove the whole thing (e.g. a title that's just "Recipe" outright,
+    however unlikely) -- something is better than nothing.
+    """
+    if not name:
+        return name
+    stripped = TRAILING_RECIPE_WORD_RE.sub("", name).strip()
+    return stripped if stripped else name
 
 
 def reorder_leading_descriptor(text):
@@ -433,7 +464,10 @@ def normalize_ingredient_phrasing(ingredients):
 NUMBER_START_RE = re.compile(r"^\s*\d")
 
 
-NO_QUANTITY_MARKERS = ("to taste", "as needed", "for frying", "for serving", "optional")
+NO_QUANTITY_MARKERS = (
+    "to taste", "as needed", "for frying", "for serving", "optional",
+    "to season", "for seasoning",
+)
 
 
 def ensure_leading_quantity(ingredients):
@@ -563,6 +597,26 @@ def build_recipe_jsonld(scraper, canonical_url=None):
 
     # Drop keys that are None / empty so the JSON-LD stays clean
     return {k: v for k, v in recipe.items() if v not in (None, "", [], {})}
+
+
+def detect_canonical_url(html):
+    """
+    Best-effort detection of a page's own canonical URL from its HTML.
+    Used when the user runs --file without also passing --url: without a
+    base URL, relative image/link URLs found while scraping (e.g.
+    "/content/dam/.../photo.jpg") can't be resolved to absolute ones and
+    end up unusable in the output. Checks <link rel="canonical"> first,
+    then an og:url meta tag (both are standard, widely-supported ways for
+    a page to declare its own URL). Returns None if neither is present.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    canonical = soup.find("link", attrs={"rel": "canonical"})
+    if canonical and canonical.get("href"):
+        return canonical["href"].strip()
+    og_url = soup.find("meta", attrs={"property": "og:url"})
+    if og_url and og_url.get("content"):
+        return og_url["content"].strip()
+    return None
 
 
 def fetch_html(url):
@@ -1313,18 +1367,26 @@ def extract_title(soup):
     heading-like element (e.g. a sitewide banner heading plus the actual
     recipe title) -- naively taking the first <h1> can grab the wrong one.
 
-    Strategy: the <title> tag reliably contains the real page title (often
-    with a site-name prefix/suffix, e.g. "Recipes - Microwave Fruit Cake
-    Recipe"). If any <h1> on the page has text that also appears in the
-    <title> tag, that's almost certainly the actual recipe title (a generic
-    banner heading like "Baking Recipes" usually won't appear in <title> at
-    all). Falls back to the first <h1>, then to <title> itself with a
-    likely site-name segment stripped off.
+    Strategy: if there's exactly one <h1> on the page, trust it directly --
+    it's almost certainly the actual editorial recipe title, even if it
+    diverges completely from the <title> tag (which is often SEO-oriented
+    and can differ in wording, e.g. a byline like "Curtis Stone's seared
+    barramundi..." as the h1 vs "Seared Barramundi ... Recipe | Coles" as
+    the title tag). With multiple <h1>s (e.g. a sitewide banner plus the
+    real title), fall back to matching against <title>: the <title> tag
+    reliably contains the real page title (often with a site-name
+    prefix/suffix), and whichever <h1> text also appears in it is almost
+    certainly the actual recipe title (a generic banner heading like
+    "Baking Recipes" usually won't appear in <title> at all). Falls back
+    further to <title> itself with a likely site-name segment stripped off.
     """
     title_tag = soup.find("title")
     title_text = title_tag.get_text(strip=True) if title_tag else None
 
     h1_texts = [h.get_text(strip=True) for h in soup.find_all("h1") if h.get_text(strip=True)]
+
+    if len(h1_texts) == 1:
+        return h1_texts[0]
 
     if title_text:
         # Prefer the longest matching h1 (most specific) that's actually
@@ -1351,11 +1413,16 @@ def extract_title(soup):
 def heuristic_scrape(html, url=None):
     """
     Best-effort extractor for pages with no schema.org/JSON-LD/microdata at
-    all (common on older, hand-coded recipe sites). This looks for a heading
-    containing 'ingredient' and a heading containing 'method'/'instructions'/
-    'directions', then grabs the text that follows each, up to the next
-    heading. It won't be as reliable as real structured data, so review the
-    output before publishing it.
+    all (common on older, hand-coded recipe sites, but also modern
+    client-rendered sites whose Recipe JSON-LD wasn't captured in a static
+    save). This looks for a heading containing 'ingredient' and a heading
+    containing 'method'/'instructions'/'directions'. If a real <ul>/<ol>
+    list sits nearby, its <li> items are used directly (the common case on
+    modern templated sites); otherwise it falls back to grabbing the text
+    that follows the heading and crudely splitting it, up to the next
+    heading (the common case on older, hand-coded pages with no real list
+    markup at all). It won't be as reliable as real structured data, so
+    review the output before publishing it.
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -1368,6 +1435,15 @@ def heuristic_scrape(html, url=None):
     for tag in soup.find_all(["script", "style"]):
         tag.decompose()
 
+    # Many recipe sites attach a legal/nutrition disclaimer block right
+    # next to (or even inside) the ingredients list (e.g. "Nutritional
+    # analysis is an estimate only..."). It's not part of the recipe, but
+    # it sits close enough to get swept in by both the list-based and
+    # text-blob-based extraction below if left in place -- so drop it
+    # outright, the same way script/style are dropped above.
+    for tag in soup.find_all(class_=lambda c: c and "disclaimer" in c.lower()):
+        tag.decompose()
+
     title = extract_title(soup)
 
     # Keywords for every section type this parser recognizes, used so a
@@ -1376,6 +1452,64 @@ def heuristic_scrape(html, url=None):
         "ingredients": ["ingredient"],
         "instructions": ["method", "instructions", "directions"],
     }
+
+    STEP_LABEL_RE = re.compile(r"^\s*step\s*\d+\s*[:.\-]?\s*", re.IGNORECASE)
+    SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+
+    def find_list_section(keywords, other_keyword_groups, strip_step_label=False, split_sentences=False):
+        """
+        Modern templated recipe sites usually mark ingredients/instructions
+        up as a real <ul>/<ol> of <li> items next to a matching heading,
+        even when (as here) the page's Recipe JSON-LD wasn't captured.
+        Preferring that real list over crudely splitting a blob of text
+        avoids mangling entries like "6 (about 100g each) Barramundi..."
+        into fragments at every digit+unit boundary. Returns a list of
+        item strings, or None if no such list is found near a matching
+        heading (letting the caller fall back to the text-blob approach).
+
+        Some sites pack several distinct actions into a single <li> (e.g.
+        one numbered "Step 4" covering nine sentences' worth of searing,
+        flipping, resting, and repeating in batches) -- not usable as one
+        step in a cook-along context. split_sentences breaks each <li>'s
+        text into one item per sentence, same as the text-blob path
+        already does; left off for ingredients, where a line can
+        legitimately contain a comma-separated clause but was never meant
+        to be split into several separate ingredient lines.
+        """
+        for tag in soup.find_all(["b", "strong", "h1", "h2", "h3", "h4", "p", "td"]):
+            label = tag.get_text(strip=True).lower()
+            if not (any(kw in label for kw in keywords) and len(label) < 40):
+                continue
+
+            list_tag = None
+            for candidate in tag.find_all_next(["ul", "ol", "h1", "h2", "h3", "h4"]):
+                if candidate.name in ("ul", "ol"):
+                    list_tag = candidate
+                    break
+                # A heading with real text marks a genuine section boundary
+                # (whether or not it's the "other" section's own heading)
+                # -- stop looking. An empty/decorative sub-heading (e.g. an
+                # unlabeled ingredient-category title) isn't a boundary --
+                # skip over it and keep looking for the list that follows.
+                if candidate.get_text(strip=True):
+                    break
+            if not list_tag:
+                continue
+
+            items = []
+            for li in list_tag.find_all("li", recursive=False):
+                text = li.get_text(" ", strip=True)
+                if strip_step_label:
+                    text = STEP_LABEL_RE.sub("", text)
+                if not text:
+                    continue
+                if split_sentences:
+                    items.extend(s.strip() for s in SENTENCE_SPLIT_RE.split(text) if s.strip())
+                else:
+                    items.append(text)
+            if items:
+                return items
+        return None
 
     def get_row_container(tag):
         """The block-level container to treat as one 'row' of content: the
@@ -1434,28 +1568,42 @@ def heuristic_scrape(html, url=None):
 
     image_url = find_best_image(soup, url=url)
 
-    ingredients_text = find_section(
+    ingredients = find_list_section(
         SECTION_KEYWORD_GROUPS["ingredients"], [SECTION_KEYWORD_GROUPS["instructions"]]
     )
-    method_text = find_section(
-        SECTION_KEYWORD_GROUPS["instructions"], [SECTION_KEYWORD_GROUPS["ingredients"]]
-    )
-
-    ingredients = split_ingredient_block(ingredients_text) if ingredients_text else []
-
-    # A leading line like "Makes one 18 cm cake" or "Serves 4" is a yield
-    # statement, not an ingredient -- pull it out if present.
     recipe_yield = None
-    if ingredients and re.match(r"^(makes|serves|yields?)\b", ingredients[0], re.IGNORECASE):
-        recipe_yield = ingredients.pop(0)
+    if ingredients is None:
+        ingredients_text = find_section(
+            SECTION_KEYWORD_GROUPS["ingredients"], [SECTION_KEYWORD_GROUPS["instructions"]]
+        )
+        ingredients = split_ingredient_block(ingredients_text) if ingredients_text else []
 
-    instructions = []
-    if method_text:
-        # Split on sentence boundaries as a rough step approximation
-        steps = re.split(r"(?<=[.!?])\s+(?=[A-Z])", method_text)
+        # A leading line like "Makes one 18 cm cake" or "Serves 4" is a
+        # yield statement, not an ingredient -- pull it out if present.
+        # (Only relevant to the text-blob path: a real ingredients <li>
+        # list doesn't have stray yield statements mixed into it.)
+        if ingredients and re.match(r"^(makes|serves|yields?)\b", ingredients[0], re.IGNORECASE):
+            recipe_yield = ingredients.pop(0)
+
+    instructions_list = find_list_section(
+        SECTION_KEYWORD_GROUPS["instructions"], [SECTION_KEYWORD_GROUPS["ingredients"]],
+        strip_step_label=True, split_sentences=True,
+    )
+    if instructions_list is not None:
         instructions = [
-            {"@type": "HowToStep", "text": clean_step_text(s)} for s in steps if s.strip()
+            {"@type": "HowToStep", "text": clean_step_text(s)} for s in instructions_list
         ]
+    else:
+        method_text = find_section(
+            SECTION_KEYWORD_GROUPS["instructions"], [SECTION_KEYWORD_GROUPS["ingredients"]]
+        )
+        instructions = []
+        if method_text:
+            # Split on sentence boundaries as a rough step approximation
+            steps = re.split(r"(?<=[.!?])\s+(?=[A-Z])", method_text)
+            instructions = [
+                {"@type": "HowToStep", "text": clean_step_text(s)} for s in steps if s.strip()
+            ]
 
     recipe = {
         "@context": "https://schema.org",
@@ -1595,6 +1743,13 @@ def main():
             print("Detected an existing recipe JSON-LD file; reusing it directly "
                   "instead of re-scraping it.", file=sys.stderr)
 
+        if not args.url:
+            detected_url = detect_canonical_url(file_content)
+            if detected_url:
+                print(f"No --url given; using the canonical URL found in the file's own "
+                      f"HTML instead: {detected_url}", file=sys.stderr)
+                args.url = detected_url
+
     def run_fallback_chain():
         """Try each remaining strategy in turn: an embedded app-state JSON
         blob, a WebPage/Article JSON-LD with the recipe embedded as plain
@@ -1673,8 +1828,22 @@ def main():
     if args.url:
         recipe_json["url"] = args.url
 
-    recipe_json = normalize_fractions_deep(recipe_json)
-    recipe_json = normalize_measurements_deep(recipe_json)
+    if "name" in recipe_json:
+        recipe_json["name"] = strip_redundant_title_suffix(recipe_json["name"])
+
+    # Only normalize fields that actually contain human-written recipe text
+    # with quantities in it -- not the whole dict. Running these regexes
+    # over every string value (URLs, author names, keywords, category,
+    # nutrition, ...) is dangerous: those fields can contain incidental
+    # digit+letter sequences that accidentally look like a unit or a
+    # temperature. In particular, a percent-encoded '/' in an image URL is
+    # literally "%2F" -- indistinguishable by these regexes from "2°F" --
+    # so a blanket deep-apply here was silently corrupting image URLs by
+    # "converting" that encoded slash into a bogus temperature reading.
+    for field in ("recipeIngredient", "recipeInstructions", "description"):
+        if field in recipe_json:
+            recipe_json[field] = normalize_fractions_deep(recipe_json[field])
+            recipe_json[field] = normalize_measurements_deep(recipe_json[field])
     if "recipeIngredient" in recipe_json:
         recipe_json["recipeIngredient"] = normalize_ingredient_phrasing(recipe_json["recipeIngredient"])
         recipe_json["recipeIngredient"] = ensure_leading_quantity(recipe_json["recipeIngredient"])
