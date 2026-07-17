@@ -143,15 +143,23 @@ def normalize_fractions_deep(obj):
 QTY_TOKEN = r"\d+\s\d+/\d+|\d+/\d+|\d+(?:\.\d+)?"
 
 METRIC_UNITS = r"(?:kilograms?|kg|grams?|g|millilit(?:re|er)s?|ml|lit(?:re|er)s?|l|centimet(?:re|er)s?|cm|millimet(?:re|er)s?|mm)"
-IMPERIAL_UNITS_CHAIN = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|in|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
+# Word forms of inch need a trailing \b (so "in" doesn't match inside "into");
+# the " symbol is unambiguous on its own and can't take a trailing \b at all,
+# since it's a non-word character -- \b never matches between two non-word
+# characters (e.g. between " and a following space or close-paren). Each
+# pattern below therefore keeps the word units under \b and adds the "
+# symbol as a separate, boundary-free alternative.
+INCH_WORDS = r"(?:inches|inch|in)"
+INCH_SYMBOL = r"\""
+IMPERIAL_UNITS_CHAIN = rf"(?:pounds?|lbs?|ounces?|oz|cups?|{INCH_WORDS}|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
 IMPERIAL_UNITS_STANDALONE = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
 
-_CHAIN_TOKEN = rf"(?:{QTY_TOKEN})\s?(?:{METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})\b"
+_CHAIN_TOKEN = rf"(?:{QTY_TOKEN})\s?(?:(?:{METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})\b|{INCH_SYMBOL})"
 CHAIN_RE = re.compile(rf"{_CHAIN_TOKEN}(?:\s*/\s*{_CHAIN_TOKEN})+", re.IGNORECASE)
-STANDALONE_RE = re.compile(rf"(?:{QTY_TOKEN})\s?{IMPERIAL_UNITS_STANDALONE}\b", re.IGNORECASE)
+STANDALONE_RE = re.compile(rf"(?:{QTY_TOKEN})\s?(?:{IMPERIAL_UNITS_STANDALONE}\b|{INCH_SYMBOL})", re.IGNORECASE)
 
-_TOKEN_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})$", re.IGNORECASE)
-_STANDALONE_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({IMPERIAL_UNITS_STANDALONE})$", re.IGNORECASE)
+_TOKEN_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN}|{INCH_SYMBOL})$", re.IGNORECASE)
+_STANDALONE_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({IMPERIAL_UNITS_STANDALONE}|{INCH_SYMBOL})$", re.IGNORECASE)
 
 TEMP_C = r"(\d+)\s*(?:\u00b0|degrees?)?\s*C\b"
 TEMP_F = r"(\d+)\s*(?:\u00b0|degrees?)?\s*F\b"
@@ -303,7 +311,7 @@ def convert_imperial_token(qty_str, unit, context=""):
             return f"{round_metric(ml, 'ml')}ml"
         grams = qty * 4.92892
         return f"{round_metric(grams, 'g')}g"
-    if unit_l in ("in", "inch", "inches"):
+    if unit_l in ("in", "inch", "inches", '"'):
         cm = qty * 2.54
         return f"{round_metric(cm, 'cm')}cm"
     return original
