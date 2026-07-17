@@ -43,7 +43,7 @@ USER_AGENT = (
 # whitespace, or by a quantity+unit pattern repeating inline.
 UNIT_PATTERN = re.compile(
     r"(?<![/\d])(?=(?:\d+[\d\s/.,]*|[\u00bd\u00bc\u00be\u2153\u2154\u215b\u215c\u215d\u215e])"
-    r"\s*(?:g|kg|ml|l|tsp|tbsp|cup|cups|oz|lb|lbs)\b)",
+    r"\s*(?:g|kg|ml|l|tsp|tbsp|tbs|cup|cups|oz|lb|lbs)\b)",
     re.IGNORECASE,
 )
 
@@ -104,6 +104,18 @@ def normalize_fractions(text):
     if not text:
         return text
 
+    print(f"BEFORE: {text}")
+
+    text = re.sub(
+        r"(\d+(?:\.\d+)?\s*(?:g|kg|ml|l|cm))\s*"
+        r"\([^)]*\b(?:cup|cups|tbsp|tbs|tablespoons?|tsp|teaspoons?|oz|ounces?|lb|lbs|pounds?|inch|inches|in)\b[^)]*\)",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    print(f"AFTER: {text}")
+
     def repl(match):
         whole, frac_char = match.group(1), match.group(2)
         frac = FRACTION_MAP[frac_char]
@@ -135,8 +147,8 @@ def normalize_fractions_deep(obj):
 QTY_TOKEN = r"\d+\s\d+/\d+|\d+/\d+|\d+(?:\.\d+)?"
 
 METRIC_UNITS = r"(?:kilograms?|kg|grams?|g|millilit(?:re|er)s?|ml|lit(?:re|er)s?|l|centimet(?:re|er)s?|cm|millimet(?:re|er)s?|mm)"
-IMPERIAL_UNITS_CHAIN = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|in|tablespoons?|tbsp|teaspoons?|tsp)"
-IMPERIAL_UNITS_STANDALONE = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|tablespoons?|tbsp|teaspoons?|tsp)"
+IMPERIAL_UNITS_CHAIN = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|in|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
+IMPERIAL_UNITS_STANDALONE = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
 
 _CHAIN_TOKEN = rf"(?:{QTY_TOKEN})\s?(?:{METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})\b"
 CHAIN_RE = re.compile(rf"{_CHAIN_TOKEN}(?:\s*/\s*{_CHAIN_TOKEN})+", re.IGNORECASE)
@@ -268,7 +280,7 @@ def convert_imperial_token(qty_str, unit, context=""):
         if grams >= 1000:
             return f"{round_metric(grams / 1000, 'kg')}kg"
         return f"{round_metric(grams, 'g')}g"
-    if unit_l in ("tbsp", "tablespoon", "tablespoons"):
+    if unit_l in ("tbsp", "tbs", "tablespoon", "tablespoons"):
         # tsp/tbsp are genuinely volume units. For liquids (oil, milk,
         # stock, extract, ...) the honest conversion is ml. For dry
         # ingredients (spices, salt, sugar, ...) recipe charts commonly
@@ -340,6 +352,7 @@ def normalize_measurements(text):
     # remaining standalone imperial-only quantities.
     text = CHAIN_RE.sub(_process_chain, text)
     text = STANDALONE_RE.sub(_process_standalone, text)
+
     return text
 
 
