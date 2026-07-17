@@ -195,18 +195,50 @@ LIQUID_KEYWORDS = (
 def is_liquid_ingredient(context_text):
     """Best-effort check of whether an ingredient line describes a liquid
     (oil, milk, stock, etc.), based on keywords in its text. Used to decide
-    whether a tsp/tbsp measurement should convert to ml (liquid) or g (dry)."""
+    whether a tsp/tbsp/cup measurement converts to ml (liquid) or g (dry)."""
     if not context_text:
         return False
     lower = context_text.lower()
     return any(kw in lower for kw in LIQUID_KEYWORDS)
 
 
+# Rough weight-per-cup for common dry ingredients (grams). "Cup" is a volume
+# unit, so a true weight conversion depends entirely on what's being
+# measured -- a cup of packed leafy herbs weighs a fraction of a cup of
+# grated cheese or granulated sugar. These are ballpark kitchen-reference
+# figures, not exact for any specific product/brand.
+CUP_WEIGHT_TABLE = [
+    (("basil", "parsley", "cilantro", "coriander leaves", "mint", "spinach",
+      "arugula", "rocket", "lettuce", "fresh herbs"), 30),
+    (("cheese", "mozzarella", "cheddar", "parmesan", "feta"), 110),
+    (("olives",), 150),
+    (("flour",), 120),
+    (("brown sugar",), 220),
+    (("sugar",), 200),
+    (("rice",), 185),
+    (("oats",), 90),
+    (("breadcrumbs", "panko"), 60),
+    (("nuts", "almonds", "walnuts", "pecans", "cashews", "pine nuts"), 120),
+    (("butter",), 227),
+]
+DEFAULT_CUP_WEIGHT_G = 120  # generic fallback for unmatched dry ingredients
+
+
+def estimate_cup_weight_grams(qty, context):
+    """Look up a rough grams-per-cup figure based on ingredient keywords in
+    the surrounding context text, falling back to a generic default."""
+    lower = (context or "").lower()
+    for keywords, grams_per_cup in CUP_WEIGHT_TABLE:
+        if any(kw in lower for kw in keywords):
+            return qty * grams_per_cup
+    return qty * DEFAULT_CUP_WEIGHT_G
+
+
 def convert_imperial_token(qty_str, unit, context=""):
     """Convert a single imperial quantity+unit to its metric equivalent
     string. Returns the original text unchanged if the quantity can't be
     parsed (e.g. a range like '6-8 oz'). `context` is the surrounding
-    ingredient text, used only to decide ml-vs-g for tsp/tbsp."""
+    ingredient text, used only to decide ml-vs-g for tsp/tbsp/cup."""
     original = f"{qty_str} {unit}".strip()
     qty = parse_quantity(qty_str)
     if qty is None:
@@ -222,10 +254,20 @@ def convert_imperial_token(qty_str, unit, context=""):
             return f"{round_metric(grams / 1000, 'kg')}kg"
         return f"{round_metric(grams, 'g')}g"
     if unit_l in ("cup", "cups"):
-        ml = qty * 236.588
-        if ml >= 1000:
-            return f"{round_metric(ml / 1000, 'l')}l"
-        return f"{round_metric(ml, 'ml')}ml"
+        # Cup is a volume unit, so weight depends on what's being measured.
+        # Liquids convert cleanly to ml; dry/solid ingredients (herbs,
+        # cheese, olives, flour, ...) get a rough weight-per-cup estimate
+        # instead, since "355ml grated cheese" isn't a meaningful quantity
+        # for a dry ingredient.
+        if is_liquid_ingredient(context):
+            ml = qty * 236.588
+            if ml >= 1000:
+                return f"{round_metric(ml / 1000, 'l')}l"
+            return f"{round_metric(ml, 'ml')}ml"
+        grams = estimate_cup_weight_grams(qty, context)
+        if grams >= 1000:
+            return f"{round_metric(grams / 1000, 'kg')}kg"
+        return f"{round_metric(grams, 'g')}g"
     if unit_l in ("tbsp", "tablespoon", "tablespoons"):
         # tsp/tbsp are genuinely volume units. For liquids (oil, milk,
         # stock, extract, ...) the honest conversion is ml. For dry
