@@ -104,8 +104,6 @@ def normalize_fractions(text):
     if not text:
         return text
 
-    print(f"BEFORE: {text}")
-
     text = re.sub(
         r"(\d+(?:\.\d+)?\s*(?:g|kg|ml|l|cm))\s*"
         r"\([^)]*\b(?:cup|cups|tbsp|tbs|tablespoons?|tsp|teaspoons?|oz|ounces?|lb|lbs|pounds?|inch|inches|in)\b[^)]*\)",
@@ -113,8 +111,6 @@ def normalize_fractions(text):
         text,
         flags=re.IGNORECASE,
     )
-
-    print(f"AFTER: {text}")
 
     def repl(match):
         whole, frac_char = match.group(1), match.group(2)
