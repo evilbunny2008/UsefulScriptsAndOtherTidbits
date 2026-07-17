@@ -1104,6 +1104,132 @@ def extract_iused_ingredients(text):
     return ingredients
 
 
+# A leading quantity + common recipe unit, used by br_line_scrape() to spot
+# ingredient-shaped lines by content rather than by any markup or heading --
+# useful on pages where quantities are just bare text between <br> tags with
+# no real list structure to key off (common on low-effort/AI-templated
+# content, but not exclusive to it).
+INGREDIENT_LINE_RE = re.compile(
+    r"^\s*(?:\d+\s\d+/\d+|\d+/\d+|\d+(?:\.\d+)?)\s*"
+    r"(?:g|kg|ml|l|cups?|tbsp|tbs|tablespoons?|tsp|teaspoons?|oz|lbs?|pinch(?:es)?|cloves?|slices?)\b",
+    re.IGNORECASE,
+)
+
+
+def _walk_line_stream(node, stop_tags=("h1", "h2", "h3", "h4")):
+    """
+    Walk `node`'s content in document order, yielding a flat stream of
+    ('text', str), ('br',), and ('li', tag) events -- recursing into plain
+    inline wrapper tags (em, strong, span, ...) but treating <li> as an
+    atomic unit (using its own get_text() rather than recursing into it)
+    and stopping entirely at the first heading tag.
+
+    This exists for pages where broken/unclosed markup (e.g. an <em> that
+    never closes) has nested real content -- a step list, even a
+    heading -- inside what looks like one long paragraph. A plain
+    .find_all() wouldn't reflect the document's real reading order in that
+    case; walking .children recursively, node by node, does, and lets the
+    caller decide what a heading boundary should mean without silently
+    wandering into an unrelated later section.
+
+    Yields a final ('stop',) event instead of returning if a stop_tag is
+    hit, so the caller knows to stop collecting rather than assuming the
+    node's content was exhausted normally.
+    """
+    for child in node.children:
+        name = getattr(child, "name", None)
+        if name in stop_tags:
+            yield ("stop",)
+            return
+        if name == "br":
+            yield ("br",)
+            continue
+        if name == "li":
+            yield ("li", child)
+            continue
+        if name is None:
+            yield ("text", str(child))
+            continue
+        for ev in _walk_line_stream(child, stop_tags):
+            if ev[0] == "stop":
+                yield ev
+                return
+            yield ev
+
+
+def br_line_scrape(html, url=None):
+    """
+    Handles pages with no real list markup for the ingredients at all --
+    just bare lines of text separated by <br> tags, sometimes with broken
+    tag nesting (e.g. an unclosed <em>) that traps genuine step-by-step
+    <li> instructions inside what looks like a single paragraph. Common on
+    low-effort or AI-templated "recipe-shaped" content, but the detection
+    itself doesn't assume that -- it just looks for a run of lines that are
+    mostly shaped like ingredient quantities (see INGREDIENT_LINE_RE),
+    regardless of heading text or list markup.
+
+    For each <p> on the page: split its content into "lines" at each <br>
+    (via _walk_line_stream), stopping if a heading is encountered (that
+    marks the start of an unrelated section that broken markup has nested
+    inside this same <p>). Any <li> elements encountered along the way are
+    collected separately as candidate instruction steps. If at least 3
+    lines were found and at least half of them look like ingredient
+    quantities, treat this as the recipe: keep only the quantity-shaped
+    lines as ingredients (dropping stray intro/outro sentences) and use
+    whatever <li> steps were collected as the instructions.
+
+    Returns None if no <p> on the page matches this pattern.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    for p in soup.find_all("p"):
+        lines, steps, current = [], [], []
+        for ev in _walk_line_stream(p):
+            if ev[0] == "text":
+                current.append(ev[1])
+            elif ev[0] == "br":
+                text = "".join(current).strip()
+                if text:
+                    lines.append(text)
+                current = []
+            elif ev[0] == "li":
+                text = "".join(current).strip()
+                if text:
+                    lines.append(text)
+                current = []
+                step_text = ev[1].get_text(" ", strip=True)
+                if step_text:
+                    steps.append(step_text)
+            elif ev[0] == "stop":
+                break
+        tail = "".join(current).strip()
+        if tail:
+            lines.append(tail)
+
+        if len(lines) < 3:
+            continue
+        matching = [l for l in lines if INGREDIENT_LINE_RE.match(l)]
+        if len(matching) < 3 or len(matching) / len(lines) < 0.5:
+            continue
+
+        title = extract_title(soup)
+        image_url = find_best_image(soup, url=url)
+        instructions = [{"@type": "HowToStep", "text": clean_step_text(s)} for s in steps]
+
+        recipe = {
+            "@context": "https://schema.org",
+            "@type": "Recipe",
+            "name": title,
+            "image": [image_url] if image_url else None,
+            "recipeIngredient": matching,
+            "recipeInstructions": instructions,
+            "url": url,
+        }
+        return {k: v for k, v in recipe.items() if v not in (None, "", [], {})}
+
+    return None
+
+
 def mntl_structured_content_scrape(html, url=None):
     """
     Handles Dotdash Meredith 'Mantle' CMS how-to articles (Treehugger, The
@@ -1497,6 +1623,14 @@ def main():
                   "list on the page at all). Ingredients were inferred from '(I used ...)' asides "
                   "in the prose -- this list is very likely incomplete, so please review and "
                   "complete it by hand before using it.", file=sys.stderr)
+            return result
+
+        result = br_line_scrape(html, url=args.url)
+        if result:
+            print("Found ingredients as bare <br>-separated lines with no real list markup "
+                  "(and possibly instructions trapped inside broken/unclosed tags). This page's "
+                  "markup is unusually malformed, so please double-check the result before "
+                  "using it.", file=sys.stderr)
             return result
 
         print("No embedded app-state recipe found; falling back to heuristic HTML parsing...",
