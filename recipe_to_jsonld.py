@@ -454,6 +454,47 @@ def reorder_leading_descriptor(text):
     return f"{qty} {rest}, {descriptor.lower()}"
 
 
+def merge_keywords(*sources):
+    """
+    Merge multiple keyword sources into one deduplicated, order-preserving,
+    comma-separated keywords string -- schema.org's Recipe.keywords is
+    conventionally a single comma-delimited string, and this keeps that
+    format regardless of how many separate sources feed into it (a site's
+    own keywords list, a "Difficulty: Easy" label, a category tag, ...) or
+    what shape each one comes in.
+
+    Each source may be None (skipped), a plain string, a comma-separated
+    string (split into individual keywords), or a list/tuple of strings.
+    Sources are processed in the order given, so if the same keyword shows
+    up from two different sources, only its first occurrence is kept.
+    Returns None if no source yields anything.
+
+    Used anywhere keywords get assembled, so adding a new keyword source
+    later is just one more argument here rather than a new spot that
+    silently overwrites whatever a previous source already set.
+    """
+    seen = set()
+    merged = []
+    for source in sources:
+        if not source:
+            continue
+        if isinstance(source, str):
+            parts = [p.strip() for p in source.split(",")]
+        elif isinstance(source, (list, tuple)):
+            parts = [str(p).strip() for p in source]
+        else:
+            continue
+        for part in parts:
+            if not part:
+                continue
+            key = part.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(part)
+    return ", ".join(merged) if merged else None
+
+
 def normalize_ingredient_phrasing(ingredients):
     """Apply reorder_leading_descriptor to a recipeIngredient list."""
     if not isinstance(ingredients, list):
@@ -587,7 +628,7 @@ def build_recipe_jsonld(scraper, canonical_url=None):
         "totalTime": iso8601_duration(safe(scraper.total_time)),
         "recipeCategory": safe(scraper.category),
         "recipeCuisine": safe(scraper.cuisine),
-        "keywords": safe(scraper.keywords),
+        "keywords": merge_keywords(safe(scraper.keywords)),
         "recipeIngredient": safe(scraper.ingredients, []),
         "recipeInstructions": instructions,
         "aggregateRating": aggregate_rating,
@@ -850,9 +891,7 @@ def build_recipe_from_app_state(node, url=None):
 
     image_url = pick_best_media_image(node.get("featuredMedia"))
 
-    keywords = node.get("keywords")
-    if isinstance(keywords, list):
-        keywords = ", ".join(keywords)
+    keywords = merge_keywords(node.get("keywords"))
 
     category = node.get("recipeCategory")
     if isinstance(category, list):
@@ -1410,6 +1449,75 @@ def extract_title(soup):
     return None
 
 
+# Matches a short "<label>: <number> <unit>" heading/blurb commonly used
+# by templated recipe sites for timing info (e.g. "Preparation time: 30
+# minutes", "Cook Time: 1 hour", "Total time: 45 mins") -- one pattern per
+# schema.org Recipe timing field. Not tied to any particular heading tag;
+# used against short text snippets from whatever candidate tags the caller
+# is already scanning.
+TIME_LABEL_PATTERNS = {
+    "prepTime": re.compile(
+        r"pre(?:p|paration)\s*time\s*:?\s*(\d+)\s*(hours?|hrs?|h\b|minutes?|mins?|m\b)",
+        re.IGNORECASE,
+    ),
+    "cookTime": re.compile(
+        r"cook(?:ing)?\s*time\s*:?\s*(\d+)\s*(hours?|hrs?|h\b|minutes?|mins?|m\b)",
+        re.IGNORECASE,
+    ),
+    "totalTime": re.compile(
+        r"total\s*time\s*:?\s*(\d+)\s*(hours?|hrs?|h\b|minutes?|mins?|m\b)",
+        re.IGNORECASE,
+    ),
+}
+
+
+def find_time_fields(soup):
+    """
+    Scan short heading/label-like tags for "Prep time: 30 minutes"-style
+    text and return {"prepTime": "PT30M", ...} for whichever of
+    prepTime/cookTime/totalTime are found (ISO 8601 duration strings, via
+    iso8601_duration). Not schema.org markup -- just a plain-text label a
+    templated site renders next to the recipe -- so this has to be found
+    by pattern rather than any specific tag/class.
+    """
+    result = {}
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "b", "strong", "p", "td"]):
+        text = tag.get_text(" ", strip=True)
+        if not text or len(text) > 60:
+            continue
+        for field, pattern in TIME_LABEL_PATTERNS.items():
+            if field in result:
+                continue
+            m = pattern.search(text)
+            if not m:
+                continue
+            qty, unit = int(m.group(1)), m.group(2).lower()
+            minutes = qty * 60 if unit.startswith("h") else qty
+            result[field] = iso8601_duration(minutes)
+    return result
+
+
+# Matches a short "Difficulty: Easy" (or Medium/Hard/Intermediate/...)
+# label, another common templated-recipe-site blurb with no schema.org
+# equivalent. Recipe has no dedicated difficulty property (and neither
+# does Nextcloud Cookbook's own API model) -- keywords is the closest fit,
+# since it's the one freeform tagging field both support.
+DIFFICULTY_LABEL_RE = re.compile(r"difficulty\s*:?\s*([A-Za-z][A-Za-z\s\-]{0,20}?)\s*$", re.IGNORECASE)
+
+
+def find_difficulty_tag(soup):
+    """Look for a short 'Difficulty: <level>' label and return just the
+    level (e.g. 'Easy'), or None if no such label is found."""
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "b", "strong", "p", "td"]):
+        text = tag.get_text(" ", strip=True)
+        if not text or len(text) > 60:
+            continue
+        m = DIFFICULTY_LABEL_RE.search(text)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def heuristic_scrape(html, url=None):
     """
     Best-effort extractor for pages with no schema.org/JSON-LD/microdata at
@@ -1450,7 +1558,7 @@ def heuristic_scrape(html, url=None):
     # scan for one section stops when it bumps into the start of another.
     SECTION_KEYWORD_GROUPS = {
         "ingredients": ["ingredient"],
-        "instructions": ["method", "instructions", "directions"],
+        "instructions": ["method", "instructions", "directions", "steps"],
     }
 
     STEP_LABEL_RE = re.compile(r"^\s*step\s*\d+\s*[:.\-]?\s*", re.IGNORECASE)
@@ -1567,6 +1675,8 @@ def heuristic_scrape(html, url=None):
         return None
 
     image_url = find_best_image(soup, url=url)
+    time_fields = find_time_fields(soup)
+    difficulty = find_difficulty_tag(soup)
 
     ingredients = find_list_section(
         SECTION_KEYWORD_GROUPS["ingredients"], [SECTION_KEYWORD_GROUPS["instructions"]]
@@ -1611,6 +1721,10 @@ def heuristic_scrape(html, url=None):
         "name": title,
         "image": [image_url] if image_url else None,
         "recipeYield": recipe_yield,
+        "prepTime": time_fields.get("prepTime"),
+        "cookTime": time_fields.get("cookTime"),
+        "totalTime": time_fields.get("totalTime"),
+        "keywords": merge_keywords(difficulty),
         "recipeIngredient": ingredients,
         "recipeInstructions": instructions,
         "url": url,
