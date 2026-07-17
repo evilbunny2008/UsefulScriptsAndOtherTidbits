@@ -153,8 +153,8 @@ STANDALONE_RE = re.compile(rf"(?:{QTY_TOKEN})\s?{IMPERIAL_UNITS_STANDALONE}\b", 
 _TOKEN_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})$", re.IGNORECASE)
 _STANDALONE_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({IMPERIAL_UNITS_STANDALONE})$", re.IGNORECASE)
 
-TEMP_C = r"(\d+)\s?\u00b0?\s?C\b"
-TEMP_F = r"(\d+)\s?\u00b0?\s?F\b"
+TEMP_C = r"(\d+)\s*(?:\u00b0|degrees?)?\s*C\b"
+TEMP_F = r"(\d+)\s*(?:\u00b0|degrees?)?\s*F\b"
 CF_PAIR_RE = re.compile(rf"{TEMP_C}\s*[/(]\s*{TEMP_F}\)?")
 FC_PAIR_RE = re.compile(rf"{TEMP_F}\s*[/(]\s*{TEMP_C}\)?")
 LONE_F_RE = re.compile(TEMP_F)
@@ -309,6 +309,34 @@ def convert_imperial_token(qty_str, unit, context=""):
     return original
 
 
+def _local_liquid_context(match, radius=40):
+    """
+    Narrow the text used to decide whether a quantity describes a liquid
+    (see is_liquid_ingredient) down to the clause the quantity actually
+    appears in, rather than the entire string being processed.
+
+    Using the whole string works fine when the string is one short
+    ingredient line, but is wrong for a multi-sentence instructions
+    paragraph that mentions several different ingredients -- e.g. "water"
+    or "oil" mentioned anywhere else in a long paragraph would otherwise
+    make an unrelated "cup of flour" earlier in that same paragraph get
+    misread as a liquid too, converting it to ml instead of g.
+
+    If the quantity sits inside a "(...)" aside -- the common case for the
+    "(I used ...)" asides this script pulls ingredients from -- use just
+    that parenthetical as context. Otherwise fall back to a modest
+    character window around the match, which is still narrower than the
+    whole string but wide enough to catch a liquid keyword sitting right
+    next to a quantity that isn't inside parentheses at all.
+    """
+    s = match.string
+    paren_start = s.rfind("(", 0, match.start())
+    paren_end = s.find(")", match.end())
+    if paren_start != -1 and paren_end != -1:
+        return s[paren_start:paren_end + 1]
+    return s[max(0, match.start() - radius):min(len(s), match.end() + radius)]
+
+
 def _process_chain(match):
     """Handle a run of qty+unit tokens joined by '/' (e.g. '175 g/6 oz',
     '18 cm / 7 in'). Keep only the metric token(s); if the whole chain is
@@ -328,7 +356,7 @@ def _process_chain(match):
     if metric_tokens:
         return "/".join(metric_tokens)
     if imperial_tokens:
-        return convert_imperial_token(*imperial_tokens[0], context=match.string)
+        return convert_imperial_token(*imperial_tokens[0], context=_local_liquid_context(match))
     return match.group(0)
 
 
@@ -336,7 +364,7 @@ def _process_standalone(match):
     m = _STANDALONE_SPLIT_RE.match(match.group(0))
     if not m:
         return match.group(0)
-    return convert_imperial_token(m.group(1), m.group(2), context=match.string)
+    return convert_imperial_token(m.group(1), m.group(2), context=_local_liquid_context(match))
 
 
 def normalize_measurements(text):
@@ -573,26 +601,43 @@ def find_best_image(soup, url=None):
     if link_tag and link_tag.get("href"):
         return absolutize(link_tag["href"].strip())
 
-    best_img, best_area = None, 0
+    candidates = []
     for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src")
+        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
         if not src:
             continue
-        if not src.lower().endswith(IMAGE_EXTENSIONS) and "?" not in src:
+        src_clean = src.strip()
+        if not src_clean.lower().split("?")[0].endswith(IMAGE_EXTENSIONS):
             continue
-        if IMAGE_SKIP_PATTERN.search(src):
+        if IMAGE_SKIP_PATTERN.search(src_clean):
             continue
+
+        # Use width/height attributes as a rough size signal when available;
+        # otherwise fall back to a neutral score so the image isn't excluded.
         try:
             width = int(img.get("width", 0))
             height = int(img.get("height", 0))
-        except (TypeError, ValueError):
+        except ValueError:
             width = height = 0
         area = width * height
-        if area > best_area:
-            best_area = area
-            best_img = src
 
-    return absolutize(best_img) if best_img else None
+        # Tiny declared dimensions (icons, tracking pixels) are disqualifying.
+        if width and width < 100:
+            continue
+        if height and height < 100:
+            continue
+
+        alt = (img.get("alt") or "").lower()
+        title_bonus = 1 if any(w in alt for w in ("recipe", "cake", "dish", "food")) else 0
+
+        candidates.append((area, title_bonus, absolutize(src_clean)))
+
+    if not candidates:
+        return None
+
+    # Prefer images explicitly tagged as food-related, then by declared area.
+    candidates.sort(key=lambda c: (c[1], c[0]), reverse=True)
+    return candidates[0][2]
 
 
 def find_recipe_node(obj, _depth=0):
@@ -805,8 +850,8 @@ def jsonld_description_scrape(html, url=None):
     Recipe type at all -- their only JSON-LD is a WebPage/Article block,
     and the entire recipe (ingredients + method) is embedded as one long
     plain-text string in the 'description' field, with 'Ingredients' and
-    'Method' as plain-text section markers (e.g. "...Ingredients\n1 cup
-    cream\n1 tsp vinegar\nMethod\nPour the cream into a jar..."). This
+    'Method' as plain-text section markers (e.g. "...Ingredients\\n1 cup
+    cream\\n1 tsp vinegar\\nMethod\\nPour the cream into a jar..."). This
     looks for that specific pattern and extracts a usable recipe from it.
     Returns None if no such pattern is found.
     """
@@ -1292,13 +1337,17 @@ def heuristic_scrape(html, url=None):
 
 
 def scrape_from_url(url):
-    html = fetch_html(url)
+    # scrape_me() in current recipe-scrapers versions doesn't forward extra
+    # kwargs like wild_mode, so fetch the HTML ourselves and call
+    # scrape_html() directly.
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    html = urlopen(request).read().decode("utf-8", errors="replace")
     scraper = scrape_html(html=html, org_url=url, wild_mode=True)
     return build_recipe_jsonld(scraper, canonical_url=url)
 
 
 def scrape_from_file(path, url=None):
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         html = f.read()
     scraper = scrape_html(html=html, org_url=url or "https://example.com", wild_mode=True)
     return build_recipe_jsonld(scraper, canonical_url=url)
