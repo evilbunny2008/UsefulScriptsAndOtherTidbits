@@ -756,6 +756,34 @@ def build_recipe_from_app_state(node, url=None):
     return {k: v for k, v in recipe.items() if v not in (None, "", [], {})}
 
 
+def try_load_existing_jsonld(file_content):
+    """
+    If a --file argument points at a file this script already produced
+    (our <script type="application/ld+json">...</script> wrapper), parse
+    and return that JSON directly instead of re-scraping it as if it were
+    a fresh recipe page. Re-scraping it would lose information -- notably,
+    recipe-scrapers' generic parser can technically read our own embedded
+    JSON-LD back in, but its canonical_url() only ever returns whatever
+    --url was passed (or the 'https://example.com' placeholder if none
+    was), throwing away the real URL that's already sitting right there
+    in the file. Returns None if this doesn't look like one of our own
+    output files.
+    """
+    m = re.search(
+        r'<script\s+type=["\']application/ld\+json["\']\s*>(.*?)</script>',
+        file_content, re.DOTALL | re.IGNORECASE,
+    )
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and data.get("@type") == "Recipe":
+        return data
+    return None
+
+
 def app_state_scrape(html, url=None):
     """
     Look for an embedded JSON app-state blob (e.g. Next.js's
@@ -1067,36 +1095,52 @@ def main():
     if not args.url and not args.file:
         parser.error("Provide --url (to fetch live) or --file (+ optional --url for canonical URL)")
 
-    try:
-        if args.file:
-            recipe_json = scrape_from_file(args.file, url=args.url)
-        else:
-            recipe_json = scrape_from_url(args.url)
-    except RecipeScrapersExceptions as e:
-        print(f"recipe-scrapers found no schema markup ({e}); "
-              f"checking for an embedded app-state recipe blob...", file=sys.stderr)
-        html = None
-        try:
-            html = open(args.file, encoding="utf-8").read() if args.file else fetch_html(args.url)
-        except Exception as e_html:
-            print(f"Could not read/fetch HTML: {e_html}", file=sys.stderr)
-            sys.exit(1)
-
-        recipe_json = app_state_scrape(html, url=args.url)
+    recipe_json = None
+    if args.file:
+        with open(args.file, encoding="utf-8") as f:
+            file_content = f.read()
+        recipe_json = try_load_existing_jsonld(file_content)
         if recipe_json:
-            print("Found recipe data in an embedded JSON blob (e.g. __NEXT_DATA__).", file=sys.stderr)
-        else:
-            print("No embedded app-state recipe found; falling back to heuristic HTML parsing...",
-                  file=sys.stderr)
+            print("Detected an existing recipe JSON-LD file; reusing it directly "
+                  "instead of re-scraping it.", file=sys.stderr)
+
+    if recipe_json is None:
+        try:
+            if args.file:
+                recipe_json = scrape_from_file(args.file, url=args.url)
+            else:
+                recipe_json = scrape_from_url(args.url)
+        except RecipeScrapersExceptions as e:
+            print(f"recipe-scrapers found no schema markup ({e}); "
+                  f"checking for an embedded app-state recipe blob...", file=sys.stderr)
+            html = None
             try:
-                recipe_json = heuristic_scrape(html, url=args.url)
-                if not recipe_json.get("recipeIngredient") and not recipe_json.get("recipeInstructions"):
-                    print("Heuristic parsing also failed to find ingredients/instructions. "
-                          "This page's markup may need a custom parser.", file=sys.stderr)
-                    sys.exit(1)
-            except Exception as e2:
-                print(f"Heuristic fallback also failed: {e2}", file=sys.stderr)
+                html = open(args.file, encoding="utf-8").read() if args.file else fetch_html(args.url)
+            except Exception as e_html:
+                print(f"Could not read/fetch HTML: {e_html}", file=sys.stderr)
                 sys.exit(1)
+
+            recipe_json = app_state_scrape(html, url=args.url)
+            if recipe_json:
+                print("Found recipe data in an embedded JSON blob (e.g. __NEXT_DATA__).", file=sys.stderr)
+            else:
+                print("No embedded app-state recipe found; falling back to heuristic HTML parsing...",
+                      file=sys.stderr)
+                try:
+                    recipe_json = heuristic_scrape(html, url=args.url)
+                    if not recipe_json.get("recipeIngredient") and not recipe_json.get("recipeInstructions"):
+                        print("Heuristic parsing also failed to find ingredients/instructions. "
+                              "This page's markup may need a custom parser.", file=sys.stderr)
+                        sys.exit(1)
+                except Exception as e2:
+                    print(f"Heuristic fallback also failed: {e2}", file=sys.stderr)
+                    sys.exit(1)
+
+    # An explicitly passed --url always takes precedence over whatever URL
+    # ended up in recipe_json, whether that came from scraping a fresh page
+    # or from reusing an existing JSON-LD file.
+    if args.url:
+        recipe_json["url"] = args.url
 
     recipe_json = normalize_fractions_deep(recipe_json)
     recipe_json = normalize_measurements_deep(recipe_json)
