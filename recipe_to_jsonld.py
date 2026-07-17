@@ -784,6 +784,86 @@ def try_load_existing_jsonld(file_content):
     return None
 
 
+def jsonld_description_scrape(html, url=None):
+    """
+    Some lightweight 'article' recipe pages don't use a proper schema.org
+    Recipe type at all -- their only JSON-LD is a WebPage/Article block,
+    and the entire recipe (ingredients + method) is embedded as one long
+    plain-text string in the 'description' field, with 'Ingredients' and
+    'Method' as plain-text section markers (e.g. "...Ingredients\\n1 cup
+    cream\\n1 tsp vinegar\\nMethod\\nPour the cream into a jar..."). This
+    looks for that specific pattern and extracts a usable recipe from it.
+    Returns None if no such pattern is found.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        if not tag.string:
+            continue
+        try:
+            data = json.loads(tag.string)
+        except json.JSONDecodeError:
+            continue
+        candidates = data if isinstance(data, list) else [data]
+        for obj in candidates:
+            if not isinstance(obj, dict) or obj.get("@type") not in (
+                "WebPage", "Article", "NewsArticle", "BlogPosting"
+            ):
+                continue
+            description = obj.get("description")
+            if not isinstance(description, str):
+                continue
+            m = re.search(
+                r"Ingredients\s*\n+(.*?)\n+Method\s*\n+(.*)$",
+                description, re.S | re.IGNORECASE,
+            )
+            if not m:
+                continue
+
+            ingredients = [line.strip() for line in m.group(1).split("\n") if line.strip()]
+
+            steps = []
+            for line in m.group(2).split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                steps.extend(
+                    s.strip() for s in re.split(r"(?<=[.!?])\s+(?=[A-Z])", line) if s.strip()
+                )
+            instructions = [{"@type": "HowToStep", "text": clean_step_text(s)} for s in steps]
+
+            intro = description.split("Ingredients")[0].strip()
+            intro_first_para = intro.split("\n")[0].strip() if intro else None
+
+            image_field = obj.get("image")
+            image_url = None
+            if isinstance(image_field, list) and image_field:
+                first_img = image_field[0]
+                image_url = first_img.get("url") if isinstance(first_img, dict) else first_img
+            elif isinstance(image_field, dict):
+                image_url = image_field.get("url")
+            elif isinstance(image_field, str):
+                image_url = image_field
+
+            author_field = obj.get("author")
+            author = author_field.get("name") if isinstance(author_field, dict) else None
+
+            recipe = {
+                "@context": "https://schema.org",
+                "@type": "Recipe",
+                "name": obj.get("name"),
+                "description": intro_first_para,
+                "author": {"@type": "Person", "name": author} if author else None,
+                "image": [image_url] if image_url else None,
+                "recipeIngredient": ingredients,
+                "recipeInstructions": instructions,
+                "url": url or obj.get("url"),
+            }
+            result = {k: v for k, v in recipe.items() if v not in (None, "", [], {})}
+            if result.get("recipeIngredient") or result.get("recipeInstructions"):
+                return result
+    return None
+
+
 def app_state_scrape(html, url=None):
     """
     Look for an embedded JSON app-state blob (e.g. Next.js's
@@ -990,7 +1070,7 @@ def scrape_from_url(url):
 
 
 def scrape_from_file(path, url=None):
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         html = f.read()
     scraper = scrape_html(html=html, org_url=url or "https://example.com", wild_mode=True)
     return build_recipe_jsonld(scraper, canonical_url=url)
@@ -1097,12 +1177,47 @@ def main():
 
     recipe_json = None
     if args.file:
-        with open(args.file, encoding="utf-8") as f:
+        with open(args.file, encoding="utf-8", errors="replace") as f:
             file_content = f.read()
         recipe_json = try_load_existing_jsonld(file_content)
         if recipe_json:
             print("Detected an existing recipe JSON-LD file; reusing it directly "
                   "instead of re-scraping it.", file=sys.stderr)
+
+    def run_fallback_chain():
+        """Try each remaining strategy in turn: an embedded app-state JSON
+        blob, a WebPage/Article JSON-LD with the recipe embedded as plain
+        text, then the raw-HTML heuristic parser. Exits the program if none
+        of them find anything."""
+        html = None
+        try:
+            html = open(args.file, encoding="utf-8", errors="replace").read() if args.file else fetch_html(args.url)
+        except Exception as e_html:
+            print(f"Could not read/fetch HTML: {e_html}", file=sys.stderr)
+            sys.exit(1)
+
+        result = app_state_scrape(html, url=args.url)
+        if result:
+            print("Found recipe data in an embedded JSON blob (e.g. __NEXT_DATA__).", file=sys.stderr)
+            return result
+
+        result = jsonld_description_scrape(html, url=args.url)
+        if result:
+            print("Found recipe data embedded in a WebPage/Article JSON-LD description.", file=sys.stderr)
+            return result
+
+        print("No embedded app-state recipe found; falling back to heuristic HTML parsing...",
+              file=sys.stderr)
+        try:
+            result = heuristic_scrape(html, url=args.url)
+            if not result.get("recipeIngredient") and not result.get("recipeInstructions"):
+                print("Heuristic parsing also failed to find ingredients/instructions. "
+                      "This page's markup may need a custom parser.", file=sys.stderr)
+                sys.exit(1)
+            return result
+        except Exception as e2:
+            print(f"Heuristic fallback also failed: {e2}", file=sys.stderr)
+            sys.exit(1)
 
     if recipe_json is None:
         try:
@@ -1113,28 +1228,17 @@ def main():
         except RecipeScrapersExceptions as e:
             print(f"recipe-scrapers found no schema markup ({e}); "
                   f"checking for an embedded app-state recipe blob...", file=sys.stderr)
-            html = None
-            try:
-                html = open(args.file, encoding="utf-8").read() if args.file else fetch_html(args.url)
-            except Exception as e_html:
-                print(f"Could not read/fetch HTML: {e_html}", file=sys.stderr)
-                sys.exit(1)
-
-            recipe_json = app_state_scrape(html, url=args.url)
-            if recipe_json:
-                print("Found recipe data in an embedded JSON blob (e.g. __NEXT_DATA__).", file=sys.stderr)
-            else:
-                print("No embedded app-state recipe found; falling back to heuristic HTML parsing...",
-                      file=sys.stderr)
-                try:
-                    recipe_json = heuristic_scrape(html, url=args.url)
-                    if not recipe_json.get("recipeIngredient") and not recipe_json.get("recipeInstructions"):
-                        print("Heuristic parsing also failed to find ingredients/instructions. "
-                              "This page's markup may need a custom parser.", file=sys.stderr)
-                        sys.exit(1)
-                except Exception as e2:
-                    print(f"Heuristic fallback also failed: {e2}", file=sys.stderr)
-                    sys.exit(1)
+            recipe_json = run_fallback_chain()
+        else:
+            # recipe-scrapers can "succeed" by finding a validly-typed
+            # Recipe schema that's nonetheless incomplete -- e.g. a stub
+            # object with just name/description/image and no actual
+            # ingredients or steps, while the real recipe content sits in a
+            # sibling JSON-LD block. Treat that the same as a hard failure.
+            if not recipe_json.get("recipeIngredient") and not recipe_json.get("recipeInstructions"):
+                print("recipe-scrapers found an incomplete Recipe schema (no ingredients/instructions); "
+                      "checking other strategies...", file=sys.stderr)
+                recipe_json = run_fallback_chain()
 
     # An explicitly passed --url always takes precedence over whatever URL
     # ended up in recipe_json, whether that came from scraping a fresh page
