@@ -200,14 +200,23 @@ LIQUID_KEYWORDS = (
 )
 
 
+LIQUID_KEYWORD_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(kw) for kw in LIQUID_KEYWORDS) + r")\b", re.IGNORECASE
+)
+
+
 def is_liquid_ingredient(context_text):
     """Best-effort check of whether an ingredient line describes a liquid
     (oil, milk, stock, etc.), based on keywords in its text. Used to decide
-    whether a tsp/tbsp/cup measurement converts to ml (liquid) or g (dry)."""
+    whether a tsp/tbsp/cup measurement converts to ml (liquid) or g (dry).
+
+    Matches on whole words only -- a naive substring check would (and
+    once did) match "rum" inside "crumbs", misclassifying breadcrumbs (and
+    anything else in that same ingredient string, e.g. a pinch of salt
+    alongside them) as a liquid and converting them to ml instead of g."""
     if not context_text:
         return False
-    lower = context_text.lower()
-    return any(kw in lower for kw in LIQUID_KEYWORDS)
+    return bool(LIQUID_KEYWORD_PATTERN.search(context_text))
 
 
 # Rough weight-per-cup for common dry ingredients (grams). "Cup" is a volume
@@ -388,6 +397,9 @@ def normalize_ingredient_phrasing(ingredients):
 NUMBER_START_RE = re.compile(r"^\s*\d")
 
 
+NO_QUANTITY_MARKERS = ("to taste", "as needed", "for frying", "for serving", "optional")
+
+
 def ensure_leading_quantity(ingredients):
     """
     Tools that recalculate ingredient amounts by serving size (e.g.
@@ -398,6 +410,11 @@ def ensure_leading_quantity(ingredients):
     measurement for something like a garnish. Group-heading lines (e.g.
     'To serve:', marked with a trailing colon) are left alone since
     they aren't ingredients at all.
+
+    Lines that already say the quantity is intentionally open-ended (e.g.
+    'canola oil, as needed') are also left alone: unlike a garnish, where
+    '1' is at least a plausible whole-item guess, prefixing '1' onto '...,
+    as needed' is self-contradictory rather than merely imprecise.
     """
     if not isinstance(ingredients, list):
         return ingredients
@@ -405,7 +422,13 @@ def ensure_leading_quantity(ingredients):
     for item in ingredients:
         if isinstance(item, str):
             stripped = item.strip()
-            if stripped and not NUMBER_START_RE.match(stripped) and not stripped.endswith(":"):
+            already_open_ended = any(marker in stripped.lower() for marker in NO_QUANTITY_MARKERS)
+            if (
+                stripped
+                and not NUMBER_START_RE.match(stripped)
+                and not stripped.endswith(":")
+                and not already_open_ended
+            ):
                 item = f"1 {stripped}"
         result.append(item)
     return result
@@ -550,43 +573,26 @@ def find_best_image(soup, url=None):
     if link_tag and link_tag.get("href"):
         return absolutize(link_tag["href"].strip())
 
-    candidates = []
+    best_img, best_area = None, 0
     for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
+        src = img.get("src") or img.get("data-src")
         if not src:
             continue
-        src_clean = src.strip()
-        if not src_clean.lower().split("?")[0].endswith(IMAGE_EXTENSIONS):
+        if not src.lower().endswith(IMAGE_EXTENSIONS) and "?" not in src:
             continue
-        if IMAGE_SKIP_PATTERN.search(src_clean):
+        if IMAGE_SKIP_PATTERN.search(src):
             continue
-
-        # Use width/height attributes as a rough size signal when available;
-        # otherwise fall back to a neutral score so the image isn't excluded.
         try:
             width = int(img.get("width", 0))
             height = int(img.get("height", 0))
-        except ValueError:
+        except (TypeError, ValueError):
             width = height = 0
         area = width * height
+        if area > best_area:
+            best_area = area
+            best_img = src
 
-        # Tiny declared dimensions (icons, tracking pixels) are disqualifying.
-        if width and width < 100:
-            continue
-        if height and height < 100:
-            continue
-
-        alt = (img.get("alt") or "").lower()
-        title_bonus = 1 if any(w in alt for w in ("recipe", "cake", "dish", "food")) else 0
-
-        candidates.append((area, title_bonus, absolutize(src_clean)))
-
-    if not candidates:
-        return None
-
-    # Prefer images explicitly tagged as food-related, then by declared area.
-    candidates.sort(key=lambda c: (c[1], c[0]), reverse=True)
-    return candidates[0][2]
+    return absolutize(best_img) if best_img else None
 
 
 def find_recipe_node(obj, _depth=0):
@@ -799,8 +805,8 @@ def jsonld_description_scrape(html, url=None):
     Recipe type at all -- their only JSON-LD is a WebPage/Article block,
     and the entire recipe (ingredients + method) is embedded as one long
     plain-text string in the 'description' field, with 'Ingredients' and
-    'Method' as plain-text section markers (e.g. "...Ingredients\\n1 cup
-    cream\\n1 tsp vinegar\\nMethod\\nPour the cream into a jar..."). This
+    'Method' as plain-text section markers (e.g. "...Ingredients\n1 cup
+    cream\n1 tsp vinegar\nMethod\nPour the cream into a jar..."). This
     looks for that specific pattern and extracts a usable recipe from it.
     Returns None if no such pattern is found.
     """
@@ -903,6 +909,223 @@ def app_state_scrape(html, url=None):
             if result.get("recipeIngredient") or result.get("recipeInstructions"):
                 return result
     return None
+
+
+# Filler words stripped when building a short ingredient descriptor out of
+# the prose immediately preceding an "(I used ...)" aside -- see
+# extract_iused_ingredients() below. Includes ordinary stopwords plus a few
+# generic kitchen-prep nouns (bowl, station, pan, ...) that tend to sit right
+# next to the actual ingredient name but aren't themselves ingredients.
+IUSED_STOPWORDS = {
+    "a", "an", "the", "of", "with", "each", "this", "that", "some", "and",
+    "my", "for", "in", "on", "to", "into", "was", "used", "bowl", "station",
+    "set", "up", "pan", "plate", "dish", "own",
+}
+IUSED_PATTERN = re.compile(r"([A-Za-z0-9,\-\s]{0,60}?)\(I used ([^)]+)\)", re.IGNORECASE)
+PLUS_SPLIT_PATTERN = re.compile(r"\s+plus\s+", re.IGNORECASE)
+
+
+# Recognizable ingredient nouns, reused from the liquid/dry-weight keyword
+# tables already in this script, plus a few other very common basics. Used
+# by extract_iused_ingredients() to spot the actual ingredient name even
+# when it's buried inside a longer descriptive clause.
+KNOWN_INGREDIENT_NOUNS = (
+    set(LIQUID_KEYWORDS)
+    | {kw for group, _ in CUP_WEIGHT_TABLE for kw in group}
+    | {"salt", "pepper", "egg", "eggs", "cheese", "sugar"}
+)
+
+
+# Rough, generic placeholder amounts for ingredients that typically show up
+# as a bare type/brand with no quantity at all (e.g. "I used canola" for
+# frying oil). These are NOT derived from the specific recipe being
+# parsed -- there's no way to know the pan size or oil depth this article
+# actually used -- they're just a plausible generic amount for that kind of
+# ingredient. Rendered as a plain leading number (not "~250ml" or similar)
+# so it still parses as a valid quantity for tools like Nextcloud Cookbook
+# that require one for serving-size scaling; the trailing "(amount not
+# stated in source)" note is what flags it as a guess rather than something
+# extracted from the text. Deliberately small and conservative: expand only
+# for ingredient types where a genuinely typical amount exists (e.g.
+# shallow-frying oil in a pan), not for anything where the "right" amount
+# varies too much to guess at all (there's no sensible generic default for
+# "cheese" or "nuts").
+DEFAULT_QUANTITY_GUESSES = (
+    (("oil",), "250ml"),  # roughly enough to shallow-fry in a pan/skillet
+)
+
+
+def guess_default_quantity(line):
+    """Look up a rough placeholder amount for a type-only ingredient line
+    (e.g. 'canola oil'), based on keywords in the line. Returns None if no
+    sensible generic default exists for this kind of ingredient."""
+    lower = line.lower()
+    for keywords, amount in DEFAULT_QUANTITY_GUESSES:
+        if any(kw in lower for kw in keywords):
+            return amount
+    return None
+
+
+def extract_iused_ingredients(text):
+    """
+    Best-effort extraction of ingredient quantities from personal-blog-style
+    "how I made it" prose, which -- lacking any real ingredients list --
+    often still names the exact amount used in a parenthetical aside right
+    after the ingredient, e.g. "a bowl of flour (I used 3/4 cup)" or "an oil
+    with a high smoking point (I used canola)".
+
+    For each match, builds one ingredient line by combining the "(I used
+    ...)" content with a short cleaned-up descriptor taken from the words
+    immediately before it -- unless that content already names the
+    ingredient itself (e.g. "beaten eggs (I used 2 eggs plus 2 tablespoons
+    of water)"), in which case the descriptor would just be redundant noise
+    and is dropped.
+
+    This is inherently a rough approximation of a real ingredients list, so
+    callers should tell the user to review/complete it -- prose rarely
+    marks every ingredient this way (a plain "eggplant" or "salt" mentioned
+    without an "(I used ...)" aside won't be picked up at all).
+    """
+
+    def clean_descriptor(text_before, max_words=6, max_descriptor_words=2):
+        words = [w.strip(",.") for w in text_before.strip().split()[-max_words:]]
+        words = [w for w in words if w.lower() not in IUSED_STOPWORDS]
+        if not words:
+            return ""
+        # If a recognizable ingredient noun turns up among the leftover
+        # words, that's a much stronger signal of the actual ingredient
+        # name than raw position is -- e.g. "oil" inside "oil high smoking
+        # point" (from "...oil with a high smoking point (I used
+        # canola)"). Prefer that single word over the whole descriptive
+        # clause it's embedded in.
+        for w in words:
+            key = w.lower().rstrip("s")
+            if key in KNOWN_INGREDIENT_NOUNS or w.lower() in KNOWN_INGREDIENT_NOUNS:
+                return w.lower()
+        # Otherwise, a short leftover span (after stripping filler) is
+        # usually just the ingredient name itself (e.g. "flour", "bread
+        # crumbs"). A longer one is more likely a descriptive clause with
+        # no recognizable noun in it -- gluing that onto the amount risks
+        # nonsense like "canola oil high smoking point", so discard it
+        # rather than guess wrong. The caller falls back to the
+        # parenthetical alone, short of a name but at least not misleading.
+        if len(words) > max_descriptor_words:
+            return ""
+        return " ".join(words).strip(" ,.")
+
+    def word_set(s):
+        return {re.sub(r"[^a-z]", "", w.lower()).rstrip("s") for w in s.split()}
+
+    ingredients = []
+    for m in IUSED_PATTERN.finditer(text or ""):
+        descriptor = clean_descriptor(m.group(1))
+        # A parenthetical can itself list more than one thing joined by
+        # "plus" (e.g. "I used 2 eggs plus 2 tablespoons of water" for an
+        # egg wash) -- each part is a distinct ingredient and should be its
+        # own line, not one run-on ingredient. Only the first part can
+        # plausibly need the preceding descriptor; later parts already name
+        # themselves (e.g. "water" doesn't need "beaten eggs" tacked on).
+        parts = [p.strip() for p in PLUS_SPLIT_PATTERN.split(m.group(2).strip()) if p.strip()]
+        for i, part in enumerate(parts):
+            if i == 0 and descriptor and not (word_set(descriptor) & word_set(part)):
+                line = f"{part} {descriptor}".strip()
+            else:
+                line = part
+            if not line:
+                continue
+            # Some asides name a type/brand rather than an amount at all
+            # (e.g. "an oil with a high smoking point (I used canola)" only
+            # tells us it was canola, never how much). For those, use a
+            # clearly-labeled rough guess if one exists for this kind of
+            # ingredient (see DEFAULT_QUANTITY_GUESSES), otherwise just
+            # flag it "as needed" -- either way, never let it fall through
+            # to ensure_leading_quantity()'s fallback, which would
+            # otherwise fabricate a meaningless bare "1" in front of it.
+            if not NUMBER_START_RE.match(part):
+                guess = guess_default_quantity(line)
+                if guess:
+                    line = f"{guess} {line}, as needed (amount not stated in source)"
+                else:
+                    line = f"{line}, as needed"
+            ingredients.append(line)
+    return ingredients
+
+
+def mntl_structured_content_scrape(html, url=None):
+    """
+    Handles Dotdash Meredith 'Mantle' CMS how-to articles (Treehugger, The
+    Spruce Eats, MNN-migrated content, etc.) that walk through a process
+    step by step under a series of <h2> headings, with no schema.org Recipe
+    markup and no ingredients list at all -- just narrative paragraphs (e.g.
+    "Breading the Eggplant" / "Time to Fry" / "Put Them Into the Freezer").
+
+    Detected via the page's 'structured-content' block (class
+    'mntl-sc-block-heading' for headings, 'mntl-sc-block-html' for body
+    paragraphs). Each heading + the paragraph(s) that follow it, up to the
+    next heading, becomes one HowToStep. Ingredients are inferred from
+    "(I used ...)" asides via extract_iused_ingredients() -- see that
+    function's docstring for why this is necessarily incomplete.
+
+    Returns None if no 'structured-content' block is found, so callers can
+    fall through to the generic heuristic parser.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    content = soup.find(class_=lambda c: c and "structured-content" in c.split())
+    if not content:
+        return None
+
+    intro_paragraphs = []
+    steps = []
+    current_heading = None
+    current_paragraphs = []
+
+    def flush():
+        if current_heading or current_paragraphs:
+            text = clean_step_text(" ".join(current_paragraphs))
+            if text:
+                steps.append({"@type": "HowToStep", "name": current_heading, "text": text}
+                             if current_heading else {"@type": "HowToStep", "text": text})
+
+    for tag in content.find_all(["h2", "h3", "p"]):
+        classes = tag.get("class") or []
+        is_heading = any("mntl-sc-block-heading" in c for c in classes)
+        is_body = any("mntl-sc-block-html" in c for c in classes)
+        if is_heading:
+            flush()
+            current_heading = tag.get_text(strip=True)
+            current_paragraphs = []
+        elif is_body:
+            text = tag.get_text(" ", strip=True)
+            if not text:
+                continue
+            if current_heading is None:
+                intro_paragraphs.append(text)
+            else:
+                current_paragraphs.append(text)
+    flush()
+
+    if not steps:
+        return None
+
+    all_body_text = " ".join(intro_paragraphs + [s.get("text", "") for s in steps])
+    ingredients = extract_iused_ingredients(all_body_text)
+
+    title = extract_title(soup)
+    image_url = find_best_image(soup, url=url)
+    description = " ".join(intro_paragraphs[:2]) if intro_paragraphs else None
+
+    recipe = {
+        "@context": "https://schema.org",
+        "@type": "Recipe",
+        "name": title,
+        "description": description,
+        "image": [image_url] if image_url else None,
+        "recipeIngredient": ingredients,
+        "recipeInstructions": steps,
+        "url": url,
+    }
+    return {k: v for k, v in recipe.items() if v not in (None, "", [], {})}
 
 
 def extract_title(soup):
@@ -1069,17 +1292,13 @@ def heuristic_scrape(html, url=None):
 
 
 def scrape_from_url(url):
-    # scrape_me() in current recipe-scrapers versions doesn't forward extra
-    # kwargs like wild_mode, so fetch the HTML ourselves and call
-    # scrape_html() directly.
-    request = Request(url, headers={"User-Agent": USER_AGENT})
-    html = urlopen(request).read().decode("utf-8", errors="replace")
+    html = fetch_html(url)
     scraper = scrape_html(html=html, org_url=url, wild_mode=True)
     return build_recipe_jsonld(scraper, canonical_url=url)
 
 
 def scrape_from_file(path, url=None):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         html = f.read()
     scraper = scrape_html(html=html, org_url=url or "https://example.com", wild_mode=True)
     return build_recipe_jsonld(scraper, canonical_url=url)
@@ -1213,6 +1432,14 @@ def main():
         result = jsonld_description_scrape(html, url=args.url)
         if result:
             print("Found recipe data embedded in a WebPage/Article JSON-LD description.", file=sys.stderr)
+            return result
+
+        result = mntl_structured_content_scrape(html, url=args.url)
+        if result:
+            print("Found a Dotdash Meredith style step-by-step how-to article (no ingredients "
+                  "list on the page at all). Ingredients were inferred from '(I used ...)' asides "
+                  "in the prose -- this list is very likely incomplete, so please review and "
+                  "complete it by hand before using it.", file=sys.stderr)
             return result
 
         print("No embedded app-state recipe found; falling back to heuristic HTML parsing...",
