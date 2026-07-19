@@ -151,12 +151,17 @@ METRIC_UNITS = r"(?:kilograms?|kg|grams?|g|millilit(?:re|er)s?|ml|lit(?:re|er)s?
 # symbol as a separate, boundary-free alternative.
 INCH_WORDS = r"(?:inches|inch|in)"
 INCH_SYMBOL = r"\""
-IMPERIAL_UNITS_CHAIN = rf"(?:pounds?|lbs?|ounces?|oz|cups?|{INCH_WORDS}|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
-IMPERIAL_UNITS_STANDALONE = r"(?:pounds?|lbs?|ounces?|oz|cups?|inches|inch|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
+# Fluid ounce is a volume unit (~29.6ml), distinct from plain "oz" (a
+# weight unit, ~28.3g) -- checked as its own alternative (not derived from
+# "oz") so "16floz" matches as one complete unit token rather than as
+# digits+"oz" with a stray leading "fl" left dangling.
+FLOZ_UNITS = r"(?:fl\.?\s*oz\.?|fluid\s*ounces?|floz)"
+IMPERIAL_UNITS_CHAIN = rf"(?:pounds?|lbs?|{FLOZ_UNITS}|ounces?|oz|cups?|{INCH_WORDS}|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
+IMPERIAL_UNITS_STANDALONE = rf"(?:pounds?|lbs?|{FLOZ_UNITS}|ounces?|oz|cups?|inches|inch|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
 
-_CHAIN_TOKEN = rf"(?:{QTY_TOKEN})\s?(?:(?:{METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})\b|{INCH_SYMBOL})"
+_CHAIN_TOKEN = rf"(?:{QTY_TOKEN})\s?(?:(?:{METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})(?![A-Za-z])|{INCH_SYMBOL})"
 CHAIN_RE = re.compile(rf"{_CHAIN_TOKEN}(?:\s*/\s*{_CHAIN_TOKEN})+", re.IGNORECASE)
-STANDALONE_RE = re.compile(rf"(?:{QTY_TOKEN})\s?(?:{IMPERIAL_UNITS_STANDALONE}\b|{INCH_SYMBOL})", re.IGNORECASE)
+STANDALONE_RE = re.compile(rf"(?:{QTY_TOKEN})\s?(?:{IMPERIAL_UNITS_STANDALONE}(?![A-Za-z])|{INCH_SYMBOL})", re.IGNORECASE)
 
 _TOKEN_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN}|{INCH_SYMBOL})$", re.IGNORECASE)
 _STANDALONE_SPLIT_RE = re.compile(rf"^({QTY_TOKEN})\s?({IMPERIAL_UNITS_STANDALONE}|{INCH_SYMBOL})$", re.IGNORECASE)
@@ -270,6 +275,9 @@ def convert_imperial_token(qty_str, unit, context=""):
         return original
 
     unit_l = unit.lower()
+    if re.fullmatch(FLOZ_UNITS, unit_l, re.IGNORECASE):
+        ml = qty * 29.5735
+        return f"{round_metric(ml, 'ml')}ml"
     if unit_l in ("oz", "ounce", "ounces"):
         grams = qty * 28.3495
         return f"{round_metric(grams, 'g')}g"
@@ -377,6 +385,40 @@ def _process_standalone(match):
 
 DEGREE_LOOKALIKE_RE = re.compile(r"\u02da(?=\s*[CF]\b)")
 
+# Matches "N cup(s) (...)" where the parenthetical is a units-equivalent
+# aside the recipe author already provided (e.g. "2 cups (16fl oz/450ml)",
+# "1 cup (240ml)") -- as opposed to a parenthetical note unrelated to units
+# (e.g. "2 cups (packed)"). Distinguishing the two is done in
+# _process_cup_paren_equivalent by checking whether the captured text
+# contains a recognizable metric unit at all.
+CUP_PAREN_RE = re.compile(rf"(?:{QTY_TOKEN})\s?cups?\s*\(\s*([^()]*?)\s*\)", re.IGNORECASE)
+
+
+def _process_cup_paren_equivalent(match):
+    """
+    Collapses "N cup(s) (X unit/Y metric)" down to just the parenthetical's
+    resolved metric value, e.g. "2 cups (16fl oz/450ml)" -> "450ml".
+
+    Without this, the outer cup quantity gets converted independently via
+    our rough, ingredient-keyword-based cup-to-weight estimate, while the
+    parenthetical -- the recipe author's own precise, authoritative
+    conversion -- is left untouched (or separately reprocessed) alongside
+    it. That produces two different numbers for the same amount, e.g.
+    "120g (225g) flour", where 120g is our generic guess and 225g is what
+    the recipe itself actually says. The parenthetical wins.
+
+    Left alone (returns the original text unchanged) when the
+    parenthetical doesn't contain a metric unit at all -- e.g. "2 cups
+    (packed)" or "2 cups (about half a jar)" -- since that's a genuine
+    non-units note, not a units-equivalent aside, and the normal cup
+    handling further down the pipeline should process the quantity as
+    usual.
+    """
+    inner = match.group(1)
+    if not re.search(rf"(?<![A-Za-z])(?:{METRIC_UNITS})(?![A-Za-z])", inner, re.IGNORECASE):
+        return match.group(0)
+    return CHAIN_RE.sub(_process_chain, inner)
+
 
 def normalize_measurements(text):
     """Strip redundant imperial units when a metric equivalent is already
@@ -398,6 +440,11 @@ def normalize_measurements(text):
     text = CF_PAIR_RE.sub(lambda m: f"{m.group(1)}\u00b0C", text)
     text = FC_PAIR_RE.sub(lambda m: f"{m.group(2)}\u00b0C", text)
     text = LONE_F_RE.sub(lambda m: f"{round(( int(m.group(1)) - 32) * 5 / 9 / 5) * 5}\u00b0C", text)
+
+    # "N cup(s) (units-equivalent)" -- collapse before the generic cup
+    # handling below gets a chance to compute its own, separate estimate
+    # for the same quantity.
+    text = CUP_PAREN_RE.sub(_process_cup_paren_equivalent, text)
 
     # Weight/length/volume: metric/imperial pairs joined by '/', then any
     # remaining standalone imperial-only quantities.
@@ -1518,6 +1565,43 @@ def find_difficulty_tag(soup):
     return None
 
 
+def extract_table_step_items(table):
+    """
+    Some sites present a short numbered step sequence as a 2-column table
+    (e.g. a header row "Step | Action" followed by one row per step)
+    instead of a <ul>/<ol>. Extracts one item per data row: if the row's
+    first cell is purely numeric (a step number) the second cell's text is
+    used as the step; otherwise the whole row's cells are joined. Header
+    rows (using <th>) are skipped.
+    """
+    items = []
+    for row in table.find_all("tr"):
+        if row.find("th"):
+            continue
+        cells = row.find_all("td")
+        if not cells:
+            continue
+        texts = [c.get_text(" ", strip=True) for c in cells]
+        if len(texts) >= 2 and re.match(r"^\d+$", texts[0].strip()):
+            text = texts[-1]
+        else:
+            text = " ".join(t for t in texts if t)
+        if text:
+            items.append(text)
+    return items
+
+
+# Headings matching these are treated as the end of the recipe's actual
+# instructions when scanning past the first matching heading for more step
+# content (see find_instructions_zone) -- common follow-up sections
+# (cleaning the appliance, tips, serving suggestions, an FAQ) that often
+# reuse words like "steps" or "instructions" themselves but aren't part of
+# the cooking method.
+INSTRUCTIONS_ZONE_EXCLUDE_KEYWORDS = (
+    "clean", "tip", "faq", "conclusion", "serving", "topping", "storage", "nutrition",
+)
+
+
 def heuristic_scrape(html, url=None):
     """
     Best-effort extractor for pages with no schema.org/JSON-LD/microdata at
@@ -1619,6 +1703,109 @@ def heuristic_scrape(html, url=None):
                 return items
         return None
 
+    def find_instructions_zone(keywords, exclude_keywords, page_title):
+        """
+        Some "recipe guide" articles split their actual cooking process
+        across several consecutive sub-headings rather than one single
+        Instructions section -- e.g. "Preparation Steps" (2 items), then
+        "Air Fryer Setup" (2 items, heading doesn't even mention "steps"),
+        then a "Step | Action" table under yet another heading. Taking
+        only the first matching heading's list (as find_list_section does)
+        misses the rest of the method entirely.
+
+        However, looking *past* the first heading's list is genuinely
+        risky: many recipe pages follow their real Method section with
+        unrelated content -- a "related recipes" carousel, for instance --
+        laid out as more <ul>/<li> markup with no heading of its own in
+        between to signal a stop. So this only even attempts to look
+        further when the first heading's own list looks suspiciously
+        incomplete (fewer than MIN_CONFIDENT_ITEMS items) -- a real,
+        self-contained method (e.g. 20+ sentence-split steps) never
+        triggers the extended search at all, which is what actually keeps
+        this safe, not the stop conditions below (those help, but aren't
+        sufcient by themselves against unheaded carousel content).
+
+        When the gate does open, keeps walking forward collecting items
+        from subsequent <ul>/<ol>/<table>s, skipping over headings with no
+        list/table directly following them, until:
+          - a heading matches one of `exclude_keywords`, or ends in "?"
+            (common follow-up sections this isn't part of: cleaning the
+            appliance, tips, serving suggestions, storage, an FAQ),
+          - a heading's text exactly repeats the page's own title -- a
+            strong signal of a duplicated/repeated "recipe card" section
+            elsewhere on the page, rather than more of the actual method,
+          - a small, firm cap on extra headings traversed is hit, or
+          - enough items have been accumulated that this no longer looks
+            like a suspiciously incomplete list.
+        Returns None if no heading matches `keywords` at all.
+        """
+        MIN_CONFIDENT_ITEMS = 4
+        MAX_EXTRA_HEADINGS = 3
+        MAX_HEADING_SKIPS = 6
+
+        for tag in soup.find_all(["b", "strong", "h1", "h2", "h3", "h4", "p", "td"]):
+            label = tag.get_text(strip=True).lower()
+            if not (any(kw in label for kw in keywords) and len(label) < 40):
+                continue
+
+            list_tag = None
+            for candidate in tag.find_all_next(["ul", "ol", "table", "h1", "h2", "h3", "h4"]):
+                if candidate.name in ("ul", "ol", "table"):
+                    list_tag = candidate
+                    break
+                if candidate.get_text(strip=True):
+                    break  # a genuine (non-empty) heading with no list -- give up on this match
+            if list_tag is None:
+                continue
+
+            def extract(list_or_table):
+                if list_or_table.name == "table":
+                    return extract_table_step_items(list_or_table)
+                found = []
+                for li in list_or_table.find_all("li", recursive=False):
+                    text = STEP_LABEL_RE.sub("", li.get_text(" ", strip=True))
+                    if text:
+                        found.extend(s.strip() for s in SENTENCE_SPLIT_RE.split(text) if s.strip())
+                return found
+
+            items = extract(list_tag)
+            if len(items) >= MIN_CONFIDENT_ITEMS:
+                return items  # looks like a complete method already -- don't go looking further
+
+            # The first list looked short -- cautiously check a few more
+            # headings in case the method continues under a separate
+            # sub-heading, same idea as above but bounded much more
+            # tightly, and only reached at all for suspiciously-short lists.
+            cursor = list_tag
+            heading_skips = 0
+            lists_consumed = 0
+            while heading_skips < MAX_HEADING_SKIPS and lists_consumed < MAX_EXTRA_HEADINGS:
+                nxt = cursor.find_next(["ul", "ol", "table", "h1", "h2", "h3", "h4"])
+                if nxt is None:
+                    break
+                if nxt.name in ("h1", "h2", "h3", "h4"):
+                    heading_text = nxt.get_text(strip=True)
+                    if not heading_text:
+                        cursor = nxt
+                        continue
+                    heading_label = heading_text.lower()
+                    if (
+                        heading_text.endswith("?")
+                        or any(kw in heading_label for kw in exclude_keywords)
+                        or (page_title and heading_text == page_title)
+                    ):
+                        break
+                    heading_skips += 1
+                    cursor = nxt
+                    continue
+                items.extend(extract(nxt))
+                lists_consumed += 1
+                cursor = nxt
+
+            if items:
+                return items
+        return None
+
     def get_row_container(tag):
         """The block-level container to treat as one 'row' of content: the
         enclosing table row if there is one, otherwise the nearest
@@ -1695,9 +1882,8 @@ def heuristic_scrape(html, url=None):
         if ingredients and re.match(r"^(makes|serves|yields?)\b", ingredients[0], re.IGNORECASE):
             recipe_yield = ingredients.pop(0)
 
-    instructions_list = find_list_section(
-        SECTION_KEYWORD_GROUPS["instructions"], [SECTION_KEYWORD_GROUPS["ingredients"]],
-        strip_step_label=True, split_sentences=True,
+    instructions_list = find_instructions_zone(
+        SECTION_KEYWORD_GROUPS["instructions"], INSTRUCTIONS_ZONE_EXCLUDE_KEYWORDS, title,
     )
     if instructions_list is not None:
         instructions = [
