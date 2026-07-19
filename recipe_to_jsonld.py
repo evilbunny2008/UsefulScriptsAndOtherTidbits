@@ -1297,6 +1297,148 @@ def _walk_line_stream(node, stop_tags=("h1", "h2", "h3", "h4")):
             yield ev
 
 
+def _wprm_field_value(container, field, label_suffix="-name"):
+    """
+    WP Recipe Maker's convention: a field's value lives on an element whose
+    class is exactly 'wprm-recipe-{field}' (possibly alongside other
+    classes, e.g. a per-recipe-ID variant), while the human-readable label
+    ("Author", "Servings", ...) lives on a separate element with an extra
+    '-name' suffix. Returns the value element's text, or None if absent.
+    """
+    el = container.find(class_=lambda c, field=field: c == f"wprm-recipe-{field}")
+    return el.get_text(" ", strip=True) if el else None
+
+
+def _wprm_minutes(soup, field):
+    """
+    Sums a WP Recipe Maker time field into total minutes. WPRM splits a
+    duration across separate hour/minute spans that share the same base
+    class (e.g. 'wprm-recipe-total_time' appears on both an -hours span
+    valued 6 and a -minutes span valued 15, for a 6h15m total) rather than
+    one combined field, so this finds every matching span and sums them,
+    treating any span whose class list also includes an '-hours' suffix as
+    hours and everything else as minutes. Returns None if the field isn't
+    present on the page at all.
+    """
+    total_minutes = 0.0
+    found = False
+    for span in soup.find_all(class_=lambda c, field=field: c == f"wprm-recipe-{field}"):
+        text = span.get_text(strip=True)
+        if not re.match(r"^\d+(\.\d+)?$", text):
+            continue
+        value = float(text)
+        found = True
+        classes = span.get("class") or []
+        if f"wprm-recipe-{field}-hours" in classes:
+            total_minutes += value * 60
+        else:
+            total_minutes += value
+    return int(round(total_minutes)) if found else None
+
+
+def _wprm_best_image(soup):
+    """Picks the largest available image from a WPRM recipe-image
+    container's srcset, falling back to its plain src. Returns None if no
+    image is present at all."""
+    container = soup.find(class_="wprm-recipe-image-container")
+    if not container:
+        return None
+    img = container.find("img")
+    if not img:
+        return None
+    srcset = img.get("srcset")
+    if srcset:
+        candidates = []
+        for part in srcset.split(","):
+            part = part.strip().split()
+            if len(part) == 2 and part[1].endswith("w"):
+                try:
+                    candidates.append((int(part[1][:-1]), part[0]))
+                except ValueError:
+                    continue
+        if candidates:
+            return max(candidates, key=lambda c: c[0])[1]
+    return img.get("src")
+
+
+def wprm_scrape(html, url=None):
+    """
+    Handles WP Recipe Maker (WPRM) print pages (URL pattern
+    /wprm_print/<slug>, common across a huge share of WordPress recipe
+    blogs) -- these carry no schema.org Recipe markup and no <h1>-<h4>
+    headings at all, just WPRM's own well-labeled class structure
+    (wprm-recipe-ingredient, wprm-recipe-instruction-text, ...). Since
+    that's specific and unambiguous, this is tried as its own strategy
+    rather than folded into the generic heuristic parser.
+
+    Returns None if no wprm-recipe-ingredients/instructions block is found,
+    so callers can fall through to the next strategy.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    ingredients_list = soup.find(class_="wprm-recipe-ingredients")
+    instructions_list = soup.find(class_="wprm-recipe-instructions")
+    if not ingredients_list and not instructions_list:
+        return None
+
+    ingredients = []
+    if ingredients_list:
+        for li in ingredients_list.select("li.wprm-recipe-ingredient"):
+            parts = []
+            for field in ("ingredient-amount", "ingredient-unit", "ingredient-name", "ingredient-notes"):
+                text = _wprm_field_value(li, field)
+                if text:
+                    parts.append(text)
+            line = " ".join(parts)
+            if line:
+                ingredients.append(line)
+
+    instructions = []
+    if instructions_list:
+        for li in instructions_list.select("li.wprm-recipe-instruction"):
+            text_el = li.find(class_="wprm-recipe-instruction-text")
+            text = text_el.get_text(" ", strip=True) if text_el else li.get_text(" ", strip=True)
+            if text:
+                instructions.append({"@type": "HowToStep", "text": clean_step_text(text)})
+
+    name_el = soup.find(class_="wprm-recipe-name")
+    summary_el = soup.find(class_="wprm-recipe-summary")
+    author = _wprm_field_value(soup, "author")
+
+    servings = _wprm_field_value(soup, "servings")
+    servings_unit = _wprm_field_value(soup, "servings-unit")
+    recipe_yield = f"{servings} {servings_unit}".strip() if servings else None
+
+    prep_minutes = _wprm_minutes(soup, "prep_time")
+    cook_minutes = _wprm_minutes(soup, "cook_time")
+    # WPRM lets a recipe define an arbitrary extra time field with its own
+    # label (e.g. "Freeze Time", "Rest Time", "Marinate Time") -- schema.org
+    # Recipe has no slot for that concept at all. cookTime is the closest
+    # semantic fit (some inactive-but-necessary step between prep and
+    # serving), so it's used as a fallback only when the recipe has no
+    # real cook_time of its own to conflict with.
+    if cook_minutes is None:
+        cook_minutes = _wprm_minutes(soup, "custom_time")
+    total_minutes = _wprm_minutes(soup, "total_time")
+
+    recipe = {
+        "@context": "https://schema.org",
+        "@type": "Recipe",
+        "name": name_el.get_text(strip=True) if name_el else None,
+        "description": summary_el.get_text(" ", strip=True) if summary_el else None,
+        "author": {"@type": "Person", "name": author} if author else None,
+        "image": [_wprm_best_image(soup)] if _wprm_best_image(soup) else None,
+        "recipeYield": recipe_yield,
+        "prepTime": iso8601_duration(prep_minutes),
+        "cookTime": iso8601_duration(cook_minutes),
+        "totalTime": iso8601_duration(total_minutes),
+        "recipeIngredient": ingredients,
+        "recipeInstructions": instructions,
+        "url": url,
+    }
+    return {k: v for k, v in recipe.items() if v not in (None, "", [], {})}
+
+
 def br_line_scrape(html, url=None):
     """
     Handles pages with no real list markup for the ingredients at all --
@@ -2065,6 +2207,12 @@ def main():
         result = app_state_scrape(html, url=args.url)
         if result:
             print("Found recipe data in an embedded JSON blob (e.g. __NEXT_DATA__).", file=sys.stderr)
+            return result
+
+        result = wprm_scrape(html, url=args.url)
+        if result:
+            print("Found a WP Recipe Maker print page (no schema.org markup present).",
+                  file=sys.stderr)
             return result
 
         result = jsonld_description_scrape(html, url=args.url)
