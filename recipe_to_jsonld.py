@@ -11,13 +11,76 @@ Usage:
     python recipe_to_jsonld.py --url "https://example.com/some-recipe"
     python recipe_to_jsonld.py --url "https://example.com/some-recipe" --nextcloud-url "https://nextcloud.example.com" --nextcloud-user "myuser" --nextcloud-pass "mypass"
     python recipe_to_jsonld.py --file saved_page.html --url "https://example.com/some-recipe" --out output.html
+    python recipe_to_jsonld.py --use-venv --file saved_page.html
+        Creates (or reuses) a dedicated virtual environment for this
+        script's own dependencies and upgrades them there, then re-runs
+        the rest of the command inside it. Useful on Debian/Ubuntu, where
+        a plain "pip install --upgrade recipe-scrapers" is blocked outside
+        a venv by PEP 668 ("externally managed environment"). Never
+        touches system/apt-managed Python packages. Safe to include on
+        every invocation -- after the first run it just re-upgrades and
+        reuses the same venv rather than recreating it.
 """
+
+import os
+import subprocess
+import sys
+
+# --- Optional self-managed virtual environment bootstrap -------------------
+#
+# This has to run, and decide whether to re-exec, before the rest of this
+# file's imports below -- recipe_scrapers/bs4/nextcloud_cookbook_api are
+# exactly the packages --use-venv might need to install, so they can't be
+# imported yet if this script is running under the system Python and those
+# packages are missing or too old there.
+
+VENV_DIR = os.path.join(os.path.expanduser("~"), ".cache", "recipe_to_jsonld", "venv")
+VENV_ACTIVE_ENV_VAR = "RECIPE_TO_JSONLD_VENV_ACTIVE"
+REQUIRED_PACKAGES = ["recipe-scrapers", "beautifulsoup4", "nextcloud-cookbook-api"]
+
+
+def _bootstrap_venv_and_reexec():
+    """
+    Creates the dedicated virtual environment at VENV_DIR if it doesn't
+    already exist, installs/upgrades this script's dependencies inside it
+    (always "--upgrade", so re-running --use-venv later picks up newer
+    releases too, not just a one-time install), then replaces the current
+    process with that venv's Python running this same script and the same
+    arguments (minus --use-venv itself, so the re-launched process
+    doesn't loop back into this bootstrap again).
+    """
+    venv_python = os.path.join(VENV_DIR, "bin", "python3")
+
+    if not os.path.exists(venv_python):
+        print(f"Creating a dedicated virtual environment at {VENV_DIR} ...", file=sys.stderr)
+        subprocess.run([sys.executable, "-m", "venv", VENV_DIR], check=True)
+
+    print(f"Installing/upgrading dependencies in the virtual environment "
+          f"({', '.join(REQUIRED_PACKAGES)}) ...", file=sys.stderr)
+    subprocess.run(
+        [venv_python, "-m", "pip", "install", "--upgrade", "--quiet"] + REQUIRED_PACKAGES,
+        check=True,
+    )
+
+    remaining_args = [a for a in sys.argv[1:] if a != "--use-venv"]
+    print("Re-launching inside the virtual environment...\n", file=sys.stderr)
+    env = dict(os.environ, **{VENV_ACTIVE_ENV_VAR: "1"})
+    os.execve(venv_python, [venv_python, os.path.abspath(__file__)] + remaining_args, env)
+
+
+if "--use-venv" in sys.argv[1:] and os.environ.get(VENV_ACTIVE_ENV_VAR) != "1":
+    try:
+        _bootstrap_venv_and_reexec()
+    except (subprocess.CalledProcessError, OSError) as e:
+        print(f"Virtual environment setup failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+# --- end bootstrap ---
 
 import argparse
 import base64
 import json
 import re
-import sys
 from datetime import datetime, timezone
 
 from bs4 import BeautifulSoup
@@ -189,6 +252,16 @@ def parse_quantity(qty_str):
         return None
 
 
+def _clean_number(value):
+    """Returns value as a plain int if it has no fractional part (e.g. 5.0
+    -> 5), otherwise leaves it as-is. round(x*2)/2 (used below for
+    'nearest 0.5' rounding) always returns a float in Python even when the
+    result is a whole number, which without this produces ugly output like
+    '5.0g' or '5.0cm' instead of the clean '5g'/'5cm' a whole-number
+    quantity should read as."""
+    return int(value) if value == int(value) else value
+
+
 def round_metric(value, unit):
     """Round a converted metric value to something recipe-realistic rather
     than a long decimal. Small quantities keep one decimal place so, e.g.,
@@ -198,11 +271,11 @@ def round_metric(value, unit):
             return int(round(value / 5) * 5)
         if value >= 5:
             return int(round(value))
-        return round(value * 2) / 2  # nearest 0.5
+        return _clean_number(round(value * 2) / 2)  # nearest 0.5
     if unit in ("kg", "l"):
         return round(value, 2)
     if unit == "cm":
-        return round(value * 2) / 2  # nearest 0.5 cm
+        return _clean_number(round(value * 2) / 2)  # nearest 0.5 cm
     return round(value, 1)
 
 
@@ -2171,6 +2244,12 @@ def main():
     parser.add_argument("--nextcloud-url", help="Nextcloud instance URL (e.g., https://nextcloud.example.com)")
     parser.add_argument("--nextcloud-user", help="Nextcloud username")
     parser.add_argument("--nextcloud-pass", help="Nextcloud password or app password")
+    parser.add_argument(
+        "--use-venv", action="store_true",
+        help="Create/reuse a dedicated virtual environment for this script's dependencies, "
+             "upgrade them there, and re-run inside it. Handled before argument parsing "
+             "normally runs; see this file's module docstring.",
+    )
     args = parser.parse_args()
 
     if not args.url and not args.file:
