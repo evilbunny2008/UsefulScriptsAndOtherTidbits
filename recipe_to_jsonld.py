@@ -234,7 +234,7 @@ TEMP_C = r"(\d+)\s*(?:\u00b0|degrees?)?\s*C\b"
 TEMP_F = r"(\d+)\s*(?:\u00b0|degrees?)?\s*F\b"
 CF_PAIR_RE = re.compile(rf"{TEMP_C}\s*[/(]\s*{TEMP_F}\)?")
 FC_PAIR_RE = re.compile(rf"{TEMP_F}\s*[/(]\s*{TEMP_C}\)?")
-LONE_F_RE = re.compile(TEMP_F)
+LONE_F_WITH_SEP_RE = re.compile(rf"(?:\s*[/(]\s*)?{TEMP_F}\)?")
 
 
 def parse_quantity(qty_str):
@@ -521,7 +521,24 @@ def normalize_measurements(text):
     # lone Fahrenheit reading when no Celsius figure appears alongside it.
     text = CF_PAIR_RE.sub(lambda m: f"{m.group(1)}\u00b0C", text)
     text = FC_PAIR_RE.sub(lambda m: f"{m.group(2)}\u00b0C", text)
-    text = LONE_F_RE.sub(lambda m: f"{round(( int(m.group(1)) - 32) * 5 / 9 / 5) * 5}\u00b0C", text)
+
+    # A Fahrenheit reading can also restate a Celsius value already given
+    # earlier in the same text with unrelated words in between (e.g.
+    # "160°C fan forced /320°F", common in Australian recipes) -- not
+    # adjacent enough for CF_PAIR_RE/FC_PAIR_RE to recognize as a pair, but
+    # still redundant. Converting it independently would otherwise leave a
+    # duplicate "...160°C fan forced /160°C" with a dangling separator, so
+    # drop the whole aside (separator, reading, and trailing paren) when
+    # it's within rounding distance of a Celsius value already present.
+    existing_celsius = [int(m) for m in re.findall(TEMP_C, text)]
+
+    def _process_lone_f(m):
+        celsius = round((int(m.group(1)) - 32) * 5 / 9 / 5) * 5
+        if any(abs(celsius - c) <= 3 for c in existing_celsius):
+            return ""
+        return f"{celsius}\u00b0C"
+
+    text = LONE_F_WITH_SEP_RE.sub(_process_lone_f, text)
 
     # "N cup(s) (units-equivalent)" -- collapse before the generic cup
     # handling below gets a chance to compute its own, separate estimate
@@ -2067,6 +2084,94 @@ def heuristic_scrape(html, url=None):
                 return items
         return None
 
+    def is_group_label_paragraph(p):
+        """
+        Distinguishes a group-label paragraph (e.g. 'FOR THE SPELT FLOUR
+        VERSION:', 'GLUTEN-FREE VERSION') from an ordinary ingredient/step
+        paragraph that just happens to have some bold text in it (e.g.
+        '**Preheat** your oven to...', where only the leading verb is
+        bold). Requires the *entire* paragraph's text to be both fully
+        uppercase and exactly match a single bold element's text -- not
+        just contain some bold text -- since a real step's partial bolding
+        wouldn't satisfy either condition on its own.
+        """
+        text = p.get_text(strip=True)
+        if not text or len(text) > 60 or not text.isupper():
+            return False
+        bold = p.find(["strong", "b"])
+        return bool(bold) and bold.get_text(strip=True) == text
+
+    def find_paragraph_section(keywords, other_keyword_groups, capture_yield=False):
+        """
+        Some sites (e.g. Shopify blog articles built with a simple
+        rich-text editor) lay out ingredients/instructions as a run of
+        individual <p> tags -- one item per paragraph -- rather than real
+        <ul>/<ol> markup or a single blob of text. Finds a heading
+        matching `keywords`, then walks its following sibling <p> tags
+        directly, treating each one as an already-complete, atomic item
+        (no further splitting attempted, unlike the cruder text-blob
+        fallback below, which can incorrectly re-split an already-atomic
+        item like "180 g (1 1/2 cups) brown rice flour" by mistaking its
+        parenthetical cup equivalent for a second, separate ingredient).
+
+        A fully-bold, fully-uppercase paragraph (see
+        is_group_label_paragraph) is treated as a group label and folded
+        into each subsequent item's text (e.g. "... (Gluten-Free
+        Version)") rather than being returned as an item itself. Stops at
+        the next heading belonging to `other_keyword_groups`, or at any
+        non-<p> sibling (a real list or divider suggests this isn't the
+        simple paragraph-per-item pattern after all).
+
+        If capture_yield is set, a leading "Makes 12"/"Serves 4"-style
+        paragraph is captured as a (item_list, recipe_yield) tuple instead
+        of being treated as an item. Returns None if no heading matches
+        `keywords`, or if it isn't followed by at least one real item.
+        """
+        other_keywords = [kw for group in other_keyword_groups for kw in group]
+
+        for tag in soup.find_all(["b", "strong", "h1", "h2", "h3", "h4", "p", "td"]):
+            label = tag.get_text(strip=True).lower()
+            if not (any(kw in label for kw in keywords) and len(label) < 40):
+                continue
+
+            heading_p = tag if tag.name == "p" else tag.find_parent("p")
+            if heading_p is None:
+                continue
+
+            items = []
+            recipe_yield = None
+            current_group = None
+            for sib in heading_p.find_next_siblings():
+                if sib.name is None:
+                    continue  # stray NavigableString between tags
+                if sib.name != "p":
+                    break  # a real list/divider -- not this pattern after all
+
+                sib_label = sib.get_text(strip=True).lower()
+                if any(kw in sib_label for kw in other_keywords) and len(sib_label) < 40:
+                    break  # reached the next section's own heading
+
+                if capture_yield and recipe_yield is None and re.match(
+                    r"^(makes|serves|yields?)\b", sib.get_text(strip=True), re.IGNORECASE
+                ):
+                    recipe_yield = sib.get_text(strip=True)
+                    continue
+
+                if is_group_label_paragraph(sib):
+                    current_group = sib.get_text(strip=True).rstrip(":").strip()
+                    continue
+
+                text = sib.get_text(" ", strip=True)
+                if not text:
+                    continue
+                if current_group:
+                    text = f"{text} ({current_group.title()})"
+                items.append(text)
+
+            if items:
+                return (items, recipe_yield) if capture_yield else items
+        return None
+
     def find_instructions_zone(keywords, exclude_keywords, page_title):
         """
         Some "recipe guide" articles split their actual cooking process
@@ -2234,6 +2339,14 @@ def heuristic_scrape(html, url=None):
     )
     recipe_yield = None
     if ingredients is None:
+        paragraph_result = find_paragraph_section(
+            SECTION_KEYWORD_GROUPS["ingredients"], [SECTION_KEYWORD_GROUPS["instructions"]],
+            capture_yield=True,
+        )
+        if paragraph_result is not None:
+            ingredients, recipe_yield = paragraph_result
+
+    if ingredients is None:
         ingredients_text = find_section(
             SECTION_KEYWORD_GROUPS["ingredients"], [SECTION_KEYWORD_GROUPS["instructions"]]
         )
@@ -2249,6 +2362,10 @@ def heuristic_scrape(html, url=None):
     instructions_list = find_instructions_zone(
         SECTION_KEYWORD_GROUPS["instructions"], INSTRUCTIONS_ZONE_EXCLUDE_KEYWORDS, title,
     )
+    if instructions_list is None:
+        instructions_list = find_paragraph_section(
+            SECTION_KEYWORD_GROUPS["instructions"], [SECTION_KEYWORD_GROUPS["ingredients"]]
+        )
     if instructions_list is not None:
         instructions = [
             {"@type": "HowToStep", "text": clean_step_text(s)} for s in instructions_list
