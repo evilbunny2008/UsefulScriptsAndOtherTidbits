@@ -2338,15 +2338,34 @@ def main():
 
         print("No embedded app-state recipe found; falling back to heuristic HTML parsing...",
               file=sys.stderr)
+
+        def save_raw_html_on_failure():
+            """When every parsing strategy has failed, save the raw,
+            unparsed HTML to --out (if given) instead of leaving the user
+            with nothing at all -- it's the starting point for building a
+            custom parser for this page, the same raw material this
+            script's author has needed for every site-specific fix so far."""
+            if not args.out:
+                return
+            try:
+                with open(args.out, "w", encoding="utf-8") as f:
+                    f.write(html)
+                print(f"Saved the raw, unparsed HTML to {args.out} for manual inspection.",
+                      file=sys.stderr)
+            except OSError as e_save:
+                print(f"Could not save raw HTML to {args.out}: {e_save}", file=sys.stderr)
+
         try:
             result = heuristic_scrape(html, url=args.url)
             if not result.get("recipeIngredient") and not result.get("recipeInstructions"):
                 print("Heuristic parsing also failed to find ingredients/instructions. "
                       "This page's markup may need a custom parser.", file=sys.stderr)
+                save_raw_html_on_failure()
                 sys.exit(1)
             return result
         except Exception as e2:
             print(f"Heuristic fallback also failed: {e2}", file=sys.stderr)
+            save_raw_html_on_failure()
             sys.exit(1)
 
     if recipe_json is None:
