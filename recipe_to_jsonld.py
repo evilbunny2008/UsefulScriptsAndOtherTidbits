@@ -1349,6 +1349,12 @@ INGREDIENT_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches a leading "Step N:"/"Step N -"/"Step N." label on a heading or
+# list item, so it can be stripped once the step's position is already
+# conveyed structurally (as a HowToStep in a list/sequence) and doesn't
+# need repeating inside the text itself.
+STEP_LABEL_RE = re.compile(r"^\s*step\s*\d+\s*[:.\-]?\s*", re.IGNORECASE)
+
 
 def _walk_line_stream(node, stop_tags=("h1", "h2", "h3", "h4")):
     """
@@ -1683,6 +1689,106 @@ def mntl_structured_content_scrape(html, url=None):
     return {k: v for k, v in recipe.items() if v not in (None, "", [], {})}
 
 
+# Matches a heading that IS a "Step N" label (not just contains one
+# somewhere in a longer sentence), e.g. "Step 1: Preheat Your Air Fryer" --
+# used by step_heading_scrape to find a run of these across a page.
+STEP_HEADING_RE = re.compile(r"^step\s*\d+\b", re.IGNORECASE)
+
+
+def render_reference_table(table):
+    """
+    Renders a simple 2-column reference table (e.g. "Burger Thickness |
+    Cooking Time") as a short inline text summary -- one "left: right" pair
+    per data row, joined by "; ". This is for tables that accompany a
+    step's prose as supplementary reference data (pick a time based on
+    thickness) rather than being a sequence of actions themselves (see
+    extract_table_step_items for that other case). Skips a header row
+    (detected via <th>); returns "" if a row doesn't have exactly 2 <td>
+    cells, since that's outside what this simple rendering handles.
+    """
+    pairs = []
+    for row in table.find_all("tr"):
+        if row.find("th"):
+            continue
+        cells = row.find_all("td")
+        if len(cells) != 2:
+            continue
+        left = cells[0].get_text(" ", strip=True)
+        right = cells[1].get_text(" ", strip=True)
+        if left and right:
+            pairs.append(f"{left}: {right}")
+    return "; ".join(pairs)
+
+
+def step_heading_scrape(html, url=None):
+    """
+    Handles "how-to" articles that lay out their method as a series of
+    "Step N: <short title>" headings (h1-h4), each immediately followed by
+    one or more descriptive paragraphs, rather than a single
+    Ingredients/Method section with real list markup, or Dotdash
+    Meredith's specific 'structured-content' class (mntl_structured_content_scrape).
+    This template shows up across a range of independently-run WordPress
+    recipe/how-to blogs, not tied to any particular CMS or class naming.
+
+    Requires at least 2 such "Step N" headings to trigger at all -- a
+    single matching heading is too weak a signal on its own (could be an
+    unrelated one-off heading that happens to start with "Step"). Returns
+    None otherwise, so callers fall through to the next strategy.
+
+    Doesn't attempt to find an ingredients list -- pages using this
+    template are often about a single packaged/pre-made food item (frozen
+    burgers, hot dogs, ...) with no real ingredients list to speak of at
+    all, so recipeIngredient is simply left absent rather than guessed at.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    step_headings = [
+        h for h in soup.find_all(["h1", "h2", "h3", "h4"])
+        if STEP_HEADING_RE.match(h.get_text(strip=True))
+    ]
+    if len(step_headings) < 2:
+        return None
+
+    steps = []
+    for heading in step_headings:
+        paragraphs = []
+        for sib in heading.find_next_siblings():
+            if sib.name in ("h1", "h2", "h3", "h4"):
+                break
+            if sib.name == "p":
+                text = sib.get_text(" ", strip=True)
+                if text:
+                    paragraphs.append(text)
+            elif sib.name == "table":
+                table_text = render_reference_table(sib)
+                if table_text:
+                    paragraphs.append(table_text)
+        text = clean_step_text(" ".join(paragraphs))
+        if not text:
+            continue
+        name = STEP_LABEL_RE.sub("", heading.get_text(strip=True)).strip()
+        step = {"@type": "HowToStep", "text": text}
+        if name:
+            step["name"] = name
+        steps.append(step)
+
+    if not steps:
+        return None
+
+    title = extract_title(soup)
+    image_url = find_best_image(soup, url=url)
+
+    recipe = {
+        "@context": "https://schema.org",
+        "@type": "Recipe",
+        "name": title,
+        "image": [image_url] if image_url else None,
+        "recipeInstructions": steps,
+        "url": url,
+    }
+    return {k: v for k, v in recipe.items() if v not in (None, "", [], {})}
+
+
 def extract_title(soup):
     """
     Pick the recipe's title, robust to pages that have more than one
@@ -1881,7 +1987,6 @@ def heuristic_scrape(html, url=None):
         "instructions": ["method", "instructions", "directions", "steps"],
     }
 
-    STEP_LABEL_RE = re.compile(r"^\s*step\s*\d+\s*[:.\-]?\s*", re.IGNORECASE)
     SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
 
     def find_list_section(keywords, other_keyword_groups, strip_step_label=False, split_sentences=False):
@@ -2326,6 +2431,13 @@ def main():
                   "list on the page at all). Ingredients were inferred from '(I used ...)' asides "
                   "in the prose -- this list is very likely incomplete, so please review and "
                   "complete it by hand before using it.", file=sys.stderr)
+            return result
+
+        result = step_heading_scrape(html, url=args.url)
+        if result:
+            print("Found a series of 'Step N' headings with no list markup and no ingredients "
+                  "list at all -- likely a how-to article for a pre-made/packaged food. Please "
+                  "review the result before using it.", file=sys.stderr)
             return result
 
         result = br_line_scrape(html, url=args.url)
