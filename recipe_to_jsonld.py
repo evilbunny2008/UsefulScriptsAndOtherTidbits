@@ -2018,6 +2018,50 @@ def find_difficulty_tag(soup):
     return None
 
 
+# Matches a heading whose *entire* text is a notes-style label (e.g.
+# "NOTES & INSPIRATION", "Notes", "Tips") -- not just a heading that
+# happens to mention "notes" somewhere, which would also match an
+# ordinary ingredient/step line like "10g baking powder (see notes)".
+NOTES_HEADING_RE = re.compile(
+    r"^(?:notes?|tips?|inspiration)(?:\s*(?:&|and)\s*(?:notes?|tips?|inspiration))*$",
+    re.IGNORECASE,
+)
+
+
+def find_notes_section(soup, max_paragraphs=10):
+    """
+    Looks for a heading like "Notes & Inspiration" or "Tips" and collects
+    the plain <p> paragraphs that follow it as supplementary notes text,
+    meant to be folded into the recipe's description. Stops at the next
+    heading of any kind, or after max_paragraphs -- a generous but firm
+    cap, since these sections can run straight into unrelated
+    footer/related-content on some pages with no heading of its own to
+    mark where the real notes end. Returns None if no matching heading is
+    found, or if it isn't followed by any real paragraph content.
+    """
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "b", "strong", "p"]):
+        label = tag.get_text(strip=True)
+        if not NOTES_HEADING_RE.match(label):
+            continue
+        heading_p = tag if tag.name == "p" else tag.find_parent("p")
+        if heading_p is None:
+            continue
+
+        notes = []
+        for sib in heading_p.find_next_siblings():
+            if sib.name is None:
+                continue  # stray NavigableString between tags
+            if sib.name != "p" or len(notes) >= max_paragraphs:
+                break  # a heading, a real list/divider, or the cap -- stop here
+            text = sib.get_text(" ", strip=True)
+            if text:
+                notes.append(text)
+
+        if notes:
+            return " ".join(notes)
+    return None
+
+
 def extract_table_step_items(table):
     """
     Some sites present a short numbered step sequence as a 2-column table
@@ -2428,6 +2472,7 @@ def heuristic_scrape(html, url=None):
     image_url = find_best_image(soup, url=url)
     time_fields = find_time_fields(soup)
     difficulty = find_difficulty_tag(soup)
+    notes = find_notes_section(soup)
 
     ingredients = find_list_section(
         SECTION_KEYWORD_GROUPS["ingredients"], [SECTION_KEYWORD_GROUPS["instructions"]]
@@ -2482,6 +2527,7 @@ def heuristic_scrape(html, url=None):
         "@context": "https://schema.org",
         "@type": "Recipe",
         "name": title,
+        "description": f"Notes: {notes}" if notes else None,
         "image": [image_url] if image_url else None,
         "recipeYield": recipe_yield,
         "prepTime": time_fields.get("prepTime"),
@@ -2670,23 +2716,32 @@ def main():
         def is_complete(r):
             return bool(r) and bool(r.get("recipeIngredient")) and bool(r.get("recipeInstructions"))
 
+        MERGEABLE_FIELDS = (
+            "recipeIngredient", "recipeInstructions", "description", "image",
+            "recipeYield", "prepTime", "cookTime", "totalTime", "keywords",
+            "recipeCategory", "recipeCuisine", "author",
+        )
+
         def merge_in(best, result, message):
-            """Merges result's recipeIngredient/recipeInstructions into
-            best wherever best is still missing them. If best is None,
-            result becomes the new best outright (silently, matching the
-            original single-strategy behavior); message is only printed
-            when a later strategy actually supplements an existing
-            partial result, not for the first strategy to find anything."""
+            """Merges any of MERGEABLE_FIELDS from result into best
+            wherever best is still missing them (not just
+            recipeIngredient/recipeInstructions -- a later strategy can
+            find a real description/keywords/image/etc. that an earlier
+            one missed, and that shouldn't be silently discarded just
+            because the earlier strategy already supplied the core
+            ingredients or instructions). If best is None, result becomes
+            the new best outright (silently, matching the original
+            single-strategy behavior); message is only printed when a
+            later strategy actually supplements an existing partial
+            result, not for the first strategy to find anything."""
             if best is None:
                 print(message, file=sys.stderr)
                 return dict(result)
             filled = False
-            if not best.get("recipeIngredient") and result.get("recipeIngredient"):
-                best["recipeIngredient"] = result["recipeIngredient"]
-                filled = True
-            if not best.get("recipeInstructions") and result.get("recipeInstructions"):
-                best["recipeInstructions"] = result["recipeInstructions"]
-                filled = True
+            for field in MERGEABLE_FIELDS:
+                if not best.get(field) and result.get(field):
+                    best[field] = result[field]
+                    filled = True
             if filled:
                 print(message, file=sys.stderr)
             return best
