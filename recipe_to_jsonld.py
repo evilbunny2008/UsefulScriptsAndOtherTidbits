@@ -630,6 +630,12 @@ NO_QUANTITY_MARKERS = (
     "to season", "for seasoning",
 )
 
+# Matches "salt" or "pepper" as whole words (so "peppermint"/"saltine"
+# aren't caught, but "sea salt", "black pepper", "salt and pepper" are).
+# Used by ensure_leading_quantity to give these a more sensible default
+# quantity than a bare "1" when no amount is stated at all.
+SALT_OR_PEPPER_RE = re.compile(r"\b(?:salt|pepper)\b", re.IGNORECASE)
+
 
 def ensure_leading_quantity(ingredients):
     """
@@ -646,6 +652,12 @@ def ensure_leading_quantity(ingredients):
     'canola oil, as needed') are also left alone: unlike a garnish, where
     '1' is at least a plausible whole-item guess, prefixing '1' onto '...,
     as needed' is self-contradictory rather than merely imprecise.
+
+    An unquantified salt/pepper line (e.g. 'Salt and pepper' with no
+    amount given at all) gets '1 pinch of' instead of the generic '1' --
+    a bare '1' reads as one whole unit of salt, which is a much odder
+    default guess than a pinch is for a seasoning that's rarely measured
+    as a discrete count in the first place.
     """
     if not isinstance(ingredients, list):
         return ingredients
@@ -660,7 +672,10 @@ def ensure_leading_quantity(ingredients):
                 and not stripped.endswith(":")
                 and not already_open_ended
             ):
-                item = f"1 {stripped}"
+                if SALT_OR_PEPPER_RE.search(stripped):
+                    item = f"1 pinch of {stripped}"
+                else:
+                    item = f"1 {stripped}"
         result.append(item)
     return result
 
