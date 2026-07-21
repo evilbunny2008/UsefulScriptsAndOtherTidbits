@@ -475,6 +475,22 @@ DEGREE_LOOKALIKE_RE = re.compile(r"\u02da(?=\s*[CF]\b)")
 # contains a recognizable metric unit at all.
 CUP_PAREN_RE = re.compile(rf"(?:{QTY_TOKEN})\s?cups?\s*\(\s*([^()]*?)\s*\)", re.IGNORECASE)
 
+# Matches a decimal number immediately followed by a metric unit (e.g. the
+# "2.50" in "2.50g", the "3.00" in "3.00 kg"), used to trim needless
+# trailing zeros -- a value like "2.50g" is no more precise than "2.5g",
+# and "3.00kg" is just "3kg". Applies regardless of whether the decimal
+# came from our own unit-conversion rounding (which already avoids this)
+# or was simply stated that way in the source recipe's own text, which
+# passes through untouched otherwise since there's no imperial unit
+# needing conversion at all.
+DECIMAL_BEFORE_METRIC_UNIT_RE = re.compile(
+    rf"(\d+\.\d+)(?=\s?{METRIC_UNITS}(?![A-Za-z]))", re.IGNORECASE
+)
+
+
+def _trim_trailing_zeros(match):
+    return match.group(1).rstrip("0").rstrip(".")
+
 
 def _process_cup_paren_equivalent(match):
     """
@@ -549,6 +565,12 @@ def normalize_measurements(text):
     # remaining standalone imperial-only quantities.
     text = CHAIN_RE.sub(_process_chain, text)
     text = STANDALONE_RE.sub(_process_standalone, text)
+
+    # Clean up any remaining over-precise metric decimals (our own
+    # conversions above already avoid this, but a source recipe stating
+    # an already-metric value like "2.50g" directly never passes through
+    # round_metric at all, so it needs its own trimming pass here).
+    text = DECIMAL_BEFORE_METRIC_UNIT_RE.sub(_trim_trailing_zeros, text)
 
     return text
 
@@ -705,7 +727,13 @@ def ensure_leading_quantity(ingredients):
                     # canola oil, as needed" would be -- so this applies
                     # even when an open-ended marker is also present,
                     # unlike the generic '1' prefix below.
-                    item = f"1 pinch of {stripped}"
+                    if "pinch" in stripped.lower():
+                        # Already says "pinch" itself (e.g. "pinch of
+                        # salt") -- just needs the leading number, not a
+                        # second, redundant "pinch of" on top.
+                        item = f"1 {stripped}"
+                    else:
+                        item = f"1 pinch of {stripped}"
                 elif not already_open_ended:
                     item = f"1 {stripped}"
         result.append(item)
@@ -1394,6 +1422,37 @@ INGREDIENT_LINE_RE = re.compile(
 # conveyed structurally (as a HowToStep in a list/sequence) and doesn't
 # need repeating inside the text itself.
 STEP_LABEL_RE = re.compile(r"^\s*step\s*\d+\s*[:.\-]?\s*", re.IGNORECASE)
+
+# Matches a leading "Makes"/"Serves"/"Yield(s)" label on a yield
+# statement, stripped so the value starts with a number (e.g. "Makes 10
+# scones" -> "10 scones") -- tools like Nextcloud Cookbook expect a
+# leading number here just as they do for ingredient quantities.
+YIELD_LABEL_RE = re.compile(r"^\s*(?:makes|serves|yields?)\s*(?:of)?\s*:?\s*", re.IGNORECASE)
+
+# Splits a yield statement from an ingredient that got run onto the same
+# line with no separator in the source (a real markup quirk seen in the
+# wild, not a delimiter we should expect reliably) -- e.g. "Makes 10
+# scones 250 g (1 cup / 8 oz) smashed pumpkin" is two separate things, not
+# one long yield statement. Finds the first point where a NEW quantity+
+# unit begins after the leading "Makes/Serves/Yields" word and splits
+# there; group(1) is the yield phrase, group(2) is everything from the
+# new ingredient onward.
+YIELD_INGREDIENT_SPLIT_RE = re.compile(
+    r"^((?:makes|serves|yields?)\b.*?)\s+"
+    r"(\d+(?:\.\d+)?\s*(?:g|kg|ml|l|cups?|tbsp|tsp|teaspoons?|tablespoons?|oz|lbs?)\b.*)$",
+    re.IGNORECASE,
+)
+
+
+def clean_recipe_yield(text):
+    """Strips a leading 'Makes'/'Serves'/'Yield(s)' label so the result
+    starts with a number. Returns the original text unchanged if nothing
+    would be left after stripping (shouldn't normally happen, but better
+    than returning an empty yield)."""
+    if not text:
+        return text
+    stripped = YIELD_LABEL_RE.sub("", text).strip()
+    return stripped or text
 
 
 def _walk_line_stream(node, stop_tags=("h1", "h2", "h3", "h4")):
@@ -2165,18 +2224,31 @@ def heuristic_scrape(html, url=None):
                 if sib.name != "p":
                     break  # a real list/divider -- not this pattern after all
 
-                sib_label = sib.get_text(strip=True).lower()
+                sib_label = sib.get_text(" ", strip=True).lower()
                 if any(kw in sib_label for kw in other_keywords) and len(sib_label) < 40:
                     break  # reached the next section's own heading
 
                 if capture_yield and recipe_yield is None and re.match(
-                    r"^(makes|serves|yields?)\b", sib.get_text(strip=True), re.IGNORECASE
+                    r"^(makes|serves|yields?)\b", sib.get_text(" ", strip=True), re.IGNORECASE
                 ):
-                    recipe_yield = sib.get_text(strip=True)
+                    sib_text = sib.get_text(" ", strip=True)
+                    split_match = YIELD_INGREDIENT_SPLIT_RE.match(sib_text)
+                    if split_match:
+                        # The source ran a yield statement and the first
+                        # ingredient together on one line with no
+                        # separator -- recover the ingredient rather than
+                        # losing it inside the yield value.
+                        recipe_yield = clean_recipe_yield(split_match.group(1))
+                        text = split_match.group(2)
+                        if current_group:
+                            text = f"{text} ({current_group.title()})"
+                        items.append(text)
+                    else:
+                        recipe_yield = clean_recipe_yield(sib_text)
                     continue
 
                 if is_group_label_paragraph(sib):
-                    current_group = sib.get_text(strip=True).rstrip(":").strip()
+                    current_group = sib.get_text(" ", strip=True).rstrip(":").strip()
                     continue
 
                 text = sib.get_text(" ", strip=True)
@@ -2380,7 +2452,7 @@ def heuristic_scrape(html, url=None):
         # (Only relevant to the text-blob path: a real ingredients <li>
         # list doesn't have stray yield statements mixed into it.)
         if ingredients and re.match(r"^(makes|serves|yields?)\b", ingredients[0], re.IGNORECASE):
-            recipe_yield = ingredients.pop(0)
+            recipe_yield = clean_recipe_yield(ingredients.pop(0))
 
     instructions_list = find_instructions_zone(
         SECTION_KEYWORD_GROUPS["instructions"], INSTRUCTIONS_ZONE_EXCLUDE_KEYWORDS, title,
