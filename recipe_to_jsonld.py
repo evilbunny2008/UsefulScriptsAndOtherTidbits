@@ -1423,6 +1423,18 @@ def _walk_line_stream(node, stop_tags=("h1", "h2", "h3", "h4")):
             return
         if name == "br":
             yield ("br",)
+            # A well-formed <br> is a void element with no children at
+            # all, so this is normally a no-op. But some editors emit a
+            # malformed "<br>...</br>" pair (an illegal closing tag) --
+            # our parser then treats everything up to that stray </br> as
+            # the <br>'s own children rather than void/self-closing, which
+            # would otherwise make all of that content vanish silently
+            # instead of being walked at all.
+            for ev in _walk_line_stream(child, stop_tags):
+                if ev[0] == "stop":
+                    yield ev
+                    return
+                yield ev
             continue
         if name == "li":
             yield ("li", child)
@@ -2101,7 +2113,7 @@ def heuristic_scrape(html, url=None):
         bold = p.find(["strong", "b"])
         return bool(bold) and bold.get_text(strip=True) == text
 
-    def find_paragraph_section(keywords, other_keyword_groups, capture_yield=False):
+    def find_paragraph_section(keywords, other_keyword_groups, capture_yield=False, split_sentences=False):
         """
         Some sites (e.g. Shopify blog articles built with a simple
         rich-text editor) lay out ingredients/instructions as a run of
@@ -2124,8 +2136,14 @@ def heuristic_scrape(html, url=None):
 
         If capture_yield is set, a leading "Makes 12"/"Serves 4"-style
         paragraph is captured as a (item_list, recipe_yield) tuple instead
-        of being treated as an item. Returns None if no heading matches
-        `keywords`, or if it isn't followed by at least one real item.
+        of being treated as an item. If split_sentences is set, a single
+        paragraph containing multiple sentences is split into one item
+        per sentence -- needed for pages where malformed markup (e.g. an
+        illegal "<br>...</br>" pair) traps everything in just one <p>, so
+        there's only ever one "sibling" to find in the first place, no
+        matter how many real steps it actually contains. Returns None if
+        no heading matches `keywords`, or if it isn't followed by at
+        least one real item.
         """
         other_keywords = [kw for group in other_keyword_groups for kw in group]
 
@@ -2164,9 +2182,14 @@ def heuristic_scrape(html, url=None):
                 text = sib.get_text(" ", strip=True)
                 if not text:
                     continue
-                if current_group:
-                    text = f"{text} ({current_group.title()})"
-                items.append(text)
+                parts = (
+                    [s.strip() for s in SENTENCE_SPLIT_RE.split(text) if s.strip()]
+                    if split_sentences else [text]
+                )
+                for part in parts:
+                    if current_group:
+                        part = f"{part} ({current_group.title()})"
+                    items.append(part)
 
             if items:
                 return (items, recipe_yield) if capture_yield else items
@@ -2364,7 +2387,8 @@ def heuristic_scrape(html, url=None):
     )
     if instructions_list is None:
         instructions_list = find_paragraph_section(
-            SECTION_KEYWORD_GROUPS["instructions"], [SECTION_KEYWORD_GROUPS["ingredients"]]
+            SECTION_KEYWORD_GROUPS["instructions"], [SECTION_KEYWORD_GROUPS["ingredients"]],
+            split_sentences=True,
         )
     if instructions_list is not None:
         instructions = [
@@ -2538,15 +2562,32 @@ def main():
                 args.url = detected_url
 
     def run_fallback_chain():
-        """Try each remaining strategy in turn: an embedded app-state JSON
-        blob, a WebPage/Article JSON-LD with the recipe embedded as plain
-        text, then the raw-HTML heuristic parser. Returns None (rather
-        than exiting directly) if every strategy fails, so the caller can
-        decide whether that's a hard failure or an acceptable outcome --
-        e.g. recipe-scrapers may have already found a usable partial
-        result (real ingredients but no instructions, say) that should be
-        kept rather than discarded just because nothing better turned up
-        for the piece that was missing."""
+        """
+        Tries each strategy in turn -- embedded app-state JSON blobs, WPRM
+        print pages, various how-to article patterns, then the generic
+        heuristic parser -- accumulating a best-so-far result and merging
+        in whichever of recipeIngredient/recipeInstructions is still
+        missing from each subsequent strategy, rather than stopping at
+        the very first strategy that finds anything at all.
+
+        This matters because a page's ingredients and instructions can
+        each need a different strategy to find correctly. For example,
+        br_line_scrape is built to find bare <br>-separated ingredient
+        lines with no real list markup, but only ever looks at <li>
+        elements for instructions -- so a page whose instructions are
+        ALSO bare <br>-separated prose (rather than <li>s) would
+        otherwise come back with ingredients but no instructions at all,
+        even though a later strategy (heuristic_scrape) might well find
+        the instructions just fine. Stops early and returns as soon as
+        both fields are filled, rather than running every remaining
+        strategy unnecessarily.
+
+        Returns None if nothing usable is found by any strategy (rather
+        than exiting directly), so the caller can decide whether that's a
+        hard failure or an acceptable outcome -- e.g. recipe-scrapers may
+        have already found a usable partial result elsewhere that should
+        be kept.
+        """
         html = None
         try:
             html = open(args.file, encoding="utf-8", errors="replace").read() if args.file else fetch_html(args.url)
@@ -2554,44 +2595,78 @@ def main():
             print(f"Could not read/fetch HTML: {e_html}", file=sys.stderr)
             return None
 
+        def is_complete(r):
+            return bool(r) and bool(r.get("recipeIngredient")) and bool(r.get("recipeInstructions"))
+
+        def merge_in(best, result, message):
+            """Merges result's recipeIngredient/recipeInstructions into
+            best wherever best is still missing them. If best is None,
+            result becomes the new best outright (silently, matching the
+            original single-strategy behavior); message is only printed
+            when a later strategy actually supplements an existing
+            partial result, not for the first strategy to find anything."""
+            if best is None:
+                print(message, file=sys.stderr)
+                return dict(result)
+            filled = False
+            if not best.get("recipeIngredient") and result.get("recipeIngredient"):
+                best["recipeIngredient"] = result["recipeIngredient"]
+                filled = True
+            if not best.get("recipeInstructions") and result.get("recipeInstructions"):
+                best["recipeInstructions"] = result["recipeInstructions"]
+                filled = True
+            if filled:
+                print(message, file=sys.stderr)
+            return best
+
+        best = None
+
         result = app_state_scrape(html, url=args.url)
         if result:
-            print("Found recipe data in an embedded JSON blob (e.g. __NEXT_DATA__).", file=sys.stderr)
-            return result
+            best = merge_in(best, result, "Found recipe data in an embedded JSON blob (e.g. __NEXT_DATA__).")
+            if is_complete(best):
+                return best
 
         result = wprm_scrape(html, url=args.url)
         if result:
-            print("Found a WP Recipe Maker print page (no schema.org markup present).",
-                  file=sys.stderr)
-            return result
+            best = merge_in(best, result, "Found a WP Recipe Maker print page (no schema.org markup present).")
+            if is_complete(best):
+                return best
 
         result = jsonld_description_scrape(html, url=args.url)
         if result:
-            print("Found recipe data embedded in a WebPage/Article JSON-LD description.", file=sys.stderr)
-            return result
+            best = merge_in(best, result, "Found recipe data embedded in a WebPage/Article JSON-LD description.")
+            if is_complete(best):
+                return best
 
         result = mntl_structured_content_scrape(html, url=args.url)
         if result:
-            print("Found a Dotdash Meredith style step-by-step how-to article (no ingredients "
-                  "list on the page at all). Ingredients were inferred from '(I used ...)' asides "
-                  "in the prose -- this list is very likely incomplete, so please review and "
-                  "complete it by hand before using it.", file=sys.stderr)
-            return result
+            best = merge_in(best, result,
+                             "Found a Dotdash Meredith style step-by-step how-to article (no ingredients "
+                             "list on the page at all). Ingredients were inferred from '(I used ...)' "
+                             "asides in the prose -- this list is very likely incomplete, so please "
+                             "review and complete it by hand before using it.")
+            if is_complete(best):
+                return best
 
         result = step_heading_scrape(html, url=args.url)
         if result:
-            print("Found a series of 'Step N' headings with no list markup and no ingredients "
-                  "list at all -- likely a how-to article for a pre-made/packaged food. Please "
-                  "review the result before using it.", file=sys.stderr)
-            return result
+            best = merge_in(best, result,
+                             "Found a series of 'Step N' headings with no list markup and no ingredients "
+                             "list at all -- likely a how-to article for a pre-made/packaged food. Please "
+                             "review the result before using it.")
+            if is_complete(best):
+                return best
 
         result = br_line_scrape(html, url=args.url)
         if result:
-            print("Found ingredients as bare <br>-separated lines with no real list markup "
-                  "(and possibly instructions trapped inside broken/unclosed tags). This page's "
-                  "markup is unusually malformed, so please double-check the result before "
-                  "using it.", file=sys.stderr)
-            return result
+            best = merge_in(best, result,
+                             "Found ingredients as bare <br>-separated lines with no real list markup "
+                             "(and possibly instructions trapped inside broken/unclosed tags). This "
+                             "page's markup is unusually malformed, so please double-check the result "
+                             "before using it.")
+            if is_complete(best):
+                return best
 
         print("No embedded app-state recipe found; falling back to heuristic HTML parsing...",
               file=sys.stderr)
@@ -2614,14 +2689,21 @@ def main():
 
         try:
             result = heuristic_scrape(html, url=args.url)
-            if not result.get("recipeIngredient") and not result.get("recipeInstructions"):
+            if result.get("recipeIngredient") or result.get("recipeInstructions"):
+                if best is not None:
+                    best = merge_in(best, result, "Found the missing piece via heuristic HTML parsing.")
+                else:
+                    best = result
+            if not best:
                 print("Heuristic parsing also failed to find ingredients/instructions. "
                       "This page's markup may need a custom parser.", file=sys.stderr)
                 save_raw_html_on_failure()
                 return None
-            return result
+            return best
         except Exception as e2:
             print(f"Heuristic fallback also failed: {e2}", file=sys.stderr)
+            if best:
+                return best
             save_raw_html_on_failure()
             return None
 
