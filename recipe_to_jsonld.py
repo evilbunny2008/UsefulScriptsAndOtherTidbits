@@ -223,6 +223,7 @@ IMPERIAL_UNITS_CHAIN = rf"(?:pounds?|lbs?|{FLOZ_UNITS}|ounces?|oz|cups?|{INCH_WO
 IMPERIAL_UNITS_STANDALONE = rf"(?:pounds?|lbs?|{FLOZ_UNITS}|ounces?|oz|cups?|inches|inch|tablespoons?|tbsp|tbs|teaspoons?|tsp)"
 
 _CHAIN_TOKEN = rf"(?:{QTY_TOKEN})\s?(?:(?:{METRIC_UNITS}|{IMPERIAL_UNITS_CHAIN})(?![A-Za-z])|{INCH_SYMBOL})"
+_CHAIN_TOKEN_RE = re.compile(_CHAIN_TOKEN, re.IGNORECASE)
 CHAIN_RE = re.compile(rf"{_CHAIN_TOKEN}(?:\s*/\s*{_CHAIN_TOKEN})+", re.IGNORECASE)
 STANDALONE_RE = re.compile(rf"(?:{QTY_TOKEN})\s?(?:{IMPERIAL_UNITS_STANDALONE}(?![A-Za-z])|{INCH_SYMBOL})", re.IGNORECASE)
 
@@ -429,8 +430,16 @@ def _local_liquid_context(match, radius=40):
 def _process_chain(match):
     """Handle a run of qty+unit tokens joined by '/' (e.g. '175 g/6 oz',
     '18 cm / 7 in'). Keep only the metric token(s); if the whole chain is
-    imperial with no metric alternative given, convert the first token."""
-    tokens = [t.strip() for t in re.split(r"\s*/\s*", match.group(0))]
+    imperial with no metric alternative given, convert the first token.
+
+    Tokens are re-extracted from the matched text by finding each
+    complete _CHAIN_TOKEN occurrence, not by splitting the text on '/' --
+    a fractional quantity on one side of the chain (e.g. '3 1/2fl oz',
+    from '100ml/3\u00bdfl oz' after fraction normalization) has its own
+    internal '/' as part of the fraction itself, which a naive split
+    can't distinguish from the '/' actually separating the two units,
+    incorrectly cutting the fraction in half."""
+    tokens = [t.group(0) for t in _CHAIN_TOKEN_RE.finditer(match.group(0))]
     metric_tokens, imperial_tokens = [], []
     for t in tokens:
         m = _TOKEN_SPLIT_RE.match(t)
