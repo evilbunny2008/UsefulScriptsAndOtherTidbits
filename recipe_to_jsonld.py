@@ -657,7 +657,12 @@ def ensure_leading_quantity(ingredients):
     amount given at all) gets '1 pinch of' instead of the generic '1' --
     a bare '1' reads as one whole unit of salt, which is a much odder
     default guess than a pinch is for a seasoning that's rarely measured
-    as a discrete count in the first place.
+    as a discrete count in the first place. Unlike the generic '1'
+    prefix, this applies even to lines that also carry an open-ended
+    marker (e.g. 'Salt and pepper, to taste' -> '1 pinch of Salt and
+    pepper, to taste'): a pinch is already an informal, approximate
+    measure, so pairing it with "to taste" isn't self-contradictory the
+    way "1 canola oil, as needed" would be.
     """
     if not isinstance(ingredients, list):
         return ingredients
@@ -666,15 +671,16 @@ def ensure_leading_quantity(ingredients):
         if isinstance(item, str):
             stripped = item.strip()
             already_open_ended = any(marker in stripped.lower() for marker in NO_QUANTITY_MARKERS)
-            if (
-                stripped
-                and not NUMBER_START_RE.match(stripped)
-                and not stripped.endswith(":")
-                and not already_open_ended
-            ):
+            if stripped and not NUMBER_START_RE.match(stripped) and not stripped.endswith(":"):
                 if SALT_OR_PEPPER_RE.search(stripped):
+                    # A pinch is already an informal, approximate measure,
+                    # so "1 pinch of salt, to taste" or "..., for
+                    # seasoning" isn't self-contradictory the way "1
+                    # canola oil, as needed" would be -- so this applies
+                    # even when an open-ended marker is also present,
+                    # unlike the generic '1' prefix below.
                     item = f"1 pinch of {stripped}"
-                else:
+                elif not already_open_ended:
                     item = f"1 {stripped}"
         result.append(item)
     return result
