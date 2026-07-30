@@ -2058,7 +2058,7 @@ def find_notes_section(soup, max_paragraphs=10):
                 notes.append(text)
 
         if notes:
-            return " ".join(notes)
+            return "\n".join(notes)
     return None
 
 
@@ -2527,7 +2527,7 @@ def heuristic_scrape(html, url=None):
         "@context": "https://schema.org",
         "@type": "Recipe",
         "name": title,
-        "description": f"Notes: {notes}" if notes else None,
+        "description": f"Notes:\n{notes}" if notes else None,
         "image": [image_url] if image_url else None,
         "recipeYield": recipe_yield,
         "prepTime": time_fields.get("prepTime"),
