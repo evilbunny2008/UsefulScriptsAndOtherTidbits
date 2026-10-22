@@ -38,7 +38,7 @@ def on_message(client, userdata, msg):
 
     global SENT_COUNTDOWN, SENT_COUNTDOWN_L1, SENT_COUNTDOWN_L2
 
-    if not msg.topic.endswith("Taps"):
+    if not msg.topic.endswith("/Tap_01") and not msg.topic.endswith("/Tap_02"):
         return
 
     parsed, payload = parse_payload(msg.topic, msg.payload)
