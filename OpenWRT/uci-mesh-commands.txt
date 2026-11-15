@@ -1,3 +1,6 @@
+# apk del wpad-basic wpad-basic-mbedtls wpad-basic-openssl wpad-basic-wolfssl wpad-mbedtls wpad-mini wpad-openssl wpad-wolfssl 
+# apk add wpad-mesh-mbedtls
+
 uci set wireless.mesh=wifi-iface
 uci set wireless.mesh.device='radio1'
 uci set wireless.mesh.mode='mesh'
@@ -6,6 +9,7 @@ uci set wireless.mesh.mesh_id='BackhaulSSID'
 uci set wireless.mesh.key='password'
 uci set wireless.mesh.network='lan'
 uci set wireless.mesh.mesh_fwding='1'
+
 # Channel 52 is the only 160MHz channel available in Australia
 uci set wireless.radio1.channel='52'
 uci set wireless.radio1.htmode='HE160'
