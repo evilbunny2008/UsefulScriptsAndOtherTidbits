@@ -1,0 +1,3 @@
+# custom udev rules for MG24 USB dongles so that it always appears as /dev/ttyZigbeeMG24 instead of ttyUSB0 etc that can change depending what other ttyUSB devices are loaded
+# Copy to /etc/udev/rules.d/MG24-USB-custom-udev.rules
+KERNEL=="ttyUSB[0-9]*", SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK="ttyZigbeeMG24", MODE="0666", GROUP="zigbee2mqtt"
