@@ -1,0 +1,83 @@
+[
+    {
+        "id": "a1f0c0de00000001",
+        "type": "inject",
+        "name": "every 2 s",
+        "props": [],
+        "repeat": "2",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "5",
+        "topic": "",
+        "x": 130,
+        "y": 100,
+        "wires": [["a1f0c0de00000002"]]
+    },
+    {
+        "id": "a1f0c0de00000002",
+        "type": "http request",
+        "name": "Shelly grid CT (em1:0)",
+        "method": "GET",
+        "ret": "obj",
+        "paytoqs": "ignore",
+        "url": "http://192.168.1.50/rpc/EM1.GetStatus?id=0",
+        "tls": "",
+        "persist": true,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 330,
+        "y": 100,
+        "wires": [["a1f0c0de00000003"]]
+    },
+    {
+        "id": "a1f0c0de00000003",
+        "type": "function",
+        "name": "grid import / export",
+        "func": "if (msg.statusCode !== 200 || typeof msg.payload?.act_power !== 'number') {\n    node.status({ fill: 'red', shape: 'dot', text: 'HTTP ' + msg.statusCode });\n    return null;\n}\n\n// Shelly convention: +W = importing from grid, -W = exporting to grid\nconst p = msg.payload.act_power;\n\nmsg.topic = 'grid';\nmsg.payload = {\n    power: p,                       // signed W\n    importW: Math.max(p, 0),\n    exportW: Math.max(-p, 0),\n    voltage: msg.payload.voltage,\n    current: msg.payload.current,\n    pf: msg.payload.pf\n};\n\nnode.status({\n    fill: p < 0 ? 'green' : 'yellow',\n    shape: 'dot',\n    text: p < 0 ? `exporting ${Math.round(-p)} W` : `importing ${Math.round(p)} W`\n});\n\nreturn msg;",
+        "outputs": 1,
+        "x": 560,
+        "y": 100,
+        "wires": [["a1f0c0de00000004", "a1f0c0de00000005"]]
+    },
+    {
+        "id": "a1f0c0de00000004",
+        "type": "rbe",
+        "name": "only on change",
+        "func": "deadband",
+        "gap": "20",
+        "start": "",
+        "inout": "out",
+        "septopics": true,
+        "property": "payload.power",
+        "x": 780,
+        "y": 100,
+        "wires": [["a1f0c0de00000006"]]
+    },
+    {
+        "id": "a1f0c0de00000005",
+        "type": "debug",
+        "name": "raw",
+        "active": false,
+        "tosidebar": true,
+        "complete": "payload",
+        "targetType": "msg",
+        "x": 770,
+        "y": 160,
+        "wires": []
+    },
+    {
+        "id": "a1f0c0de00000006",
+        "type": "debug",
+        "name": "grid power (changed > 20 W)",
+        "active": true,
+        "tosidebar": true,
+        "complete": "payload",
+        "targetType": "msg",
+        "x": 1010,
+        "y": 100,
+        "wires": []
+    }
+]
